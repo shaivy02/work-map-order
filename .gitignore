@@ -1,0 +1,22 @@
+# macOS junk
+.DS_Store
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+uspv_venv/
+
+# outputs (generated)
+outputs_work_orders/master_tracker_mapped.csv
+outputs_work_orders/master_tracker_skipped.csv
+outputs_work_orders/work_orders.geojson
+outputs_work_orders/supervisor_*.html
+
+# optional: ignore raw data files (recommended if sensitive/large)
+# Centreline - Version 2 - 4326.csv
+# MASTER TRACKER(RAW DATA).csv
+# Master Tracker Prototype (new TCL) - JL.xlsx
