@@ -19,3 +19,4 @@ outputs_work_orders/
 *.geojson
 *mapped*.csv
 *skipped*.csv
+.DS_Store
