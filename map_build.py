@@ -2757,4 +2757,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if os.environ.get("STATIC_BUILD", "").strip() == "1":
+        log("STATIC_BUILD=1 detected — running one-time build only")
+        with FILE_LOCK:
+            build_everything()
+    else:
+        main()
