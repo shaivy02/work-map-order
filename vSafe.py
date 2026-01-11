@@ -264,7 +264,11 @@ MASTER_COLUMNS = [
     "Side of Road Cleared",
 
     "Snow Dumped Site",
+
+    # === NEW — COMMENTS ===
+    "Comments",
 ]
+
 
 
 FORM_TO_MASTER = {
@@ -281,6 +285,38 @@ FORM_TO_MASTER = {
 }
 MASTER_TO_FORM = {v: k for k, v in FORM_TO_MASTER.items()}
 
+DISPLAY_FIELDS_FORM = [
+    "WO",
+    "District__NL",
+    "Ward__NL",
+    "Date__NL",
+    "Shift__NL",
+    "Supervisor__NL",
+    "Location",
+    "From",
+    "To",
+    "Type__NL",
+
+    "# of Equipment (Dump Trucks)",
+    "Dump Truck Provider Contractor",
+    "# of Loads",
+    "Tonnes",
+    "One Side/ Both Sides",
+    "Side of Road Cleared",
+    "Snow Dumped Site",
+    "Comments",
+
+    "__submission_id",
+]
+
+def master_col_for_form_field(form_key: str) -> str:
+    # FORM_TO_MASTER covers the “__NL” ones + From/To/Type etc.
+    # Any fields not listed there are assumed to match master column names exactly.
+    return FORM_TO_MASTER.get(form_key, form_key)
+
+def value_for_form_field(row: dict, form_key: str):
+    mcol = master_col_for_form_field(form_key)
+    return row.get(mcol, "")
 
 def ensure_intake_file():
     if not os.path.exists(INTAKE_PATH):
@@ -310,6 +346,37 @@ def ensure_intake_file():
         if changed:
             df.to_csv(INTAKE_PATH, index=False, encoding="utf-8")
             log("INTAKE: patched intake file to include required columns.")
+
+def ensure_master_has_columns():
+    """
+    Make sure MASTER_TRACKER_PATH contains all MASTER_COLUMNS (safe patch).
+    Without this, intake fields that don't exist in the master CSV get dropped.
+    """
+    if not os.path.exists(MASTER_TRACKER_PATH):
+        return
+
+    with FILE_LOCK:
+        try:
+            df = pd.read_csv(MASTER_TRACKER_PATH, encoding="latin-1")
+        except Exception:
+            # fallback
+            df = pd.read_csv(MASTER_TRACKER_PATH, encoding="utf-8")
+
+        changed = False
+        for c in MASTER_COLUMNS:
+            if c not in df.columns:
+                df[c] = ""
+                changed = True
+
+        # Keep __submission_id if present; if missing, create it
+        if "__submission_id" not in df.columns:
+            df["__submission_id"] = ""
+            changed = True
+
+        if changed:
+            df.to_csv(MASTER_TRACKER_PATH, index=False, encoding="latin-1")
+            log("MASTER: patched master tracker to include required columns.")
+
 
 
 
@@ -685,6 +752,7 @@ def apply_intake_to_master():
     global LAST_MASTER_WRITE_BY_INTAKE_AT
 
     ensure_intake_file()
+    ensure_master_has_columns()
     if not os.path.exists(MASTER_TRACKER_PATH):
         log("INTAKE APPLY: master tracker missing; cannot apply.")
         return 0, []
@@ -786,6 +854,109 @@ def apply_intake_to_master():
         log(f"INTAKE APPLY: applied {applied} new row(s) into MASTER_TRACKER.")
         return applied, applied_items
 
+def build_segment_popup(props: dict) -> str:
+    wo_m_str = props.get("WO_m_display", "")
+    wo_km_str = props.get("WO_km_display", "")
+    sup_html = props.get("Supervisor_link_html", html.escape(str(props.get("Supervisor", ""))))
+    shift_html = props.get("Shift_html", html.escape(str(props.get("Shift", ""))))
+
+    extra = ""
+    if props.get("route_mode"):
+        extra = (
+            "<div style='margin-top:6px;padding:6px;border-radius:6px;background:#fff3cd;border:1px solid #ffeeba;'>"
+            f"<b>Routing:</b> {html.escape(str(props.get('route_mode')))}"
+            "</div>"
+        )
+
+    # NOTE: This is a SEGMENT popup; include segment fields if you want.
+    seg_idx = props.get("Segment_idx", "")
+    total_segments = props.get("Total_Segments", "")
+
+    loc = props.get("Location", "")
+    to_ = props.get("To", "")
+    frm = props.get("From", "")
+
+    return f"""
+    <div style="font-family:Arial;font-size:13px;line-height:1.25;">
+      <b>WO:</b> {html.escape(str(props.get("WO", "")))}<br>
+      <b>Segment:</b> {html.escape(str(seg_idx))}<br>
+      <b>Total Segments:</b> {html.escape(str(total_segments))}<br>
+      <b>Location:</b> {html.escape(str(loc))}<br>
+      <b>To:</b> {html.escape(str(to_))}<br>
+      <b>From:</b> {html.escape(str(frm))}<br>
+      <b>Distance (m):</b> {html.escape(str(wo_m_str))}<br>
+      <b>Distance (km):</b> {html.escape(str(wo_km_str))}<br>
+      {extra}
+      <hr style="margin:6px 0;">
+      <b>Supervisor:</b> {sup_html}<br>
+      <b>Shift:</b> {shift_html}<br>
+    </div>
+    """
+
+def build_workorder_popup(props: dict) -> str:
+    wo = props.get("WO", "")
+    total_segments = props.get("Total_Segments", "")
+
+    loc = props.get("Location", "")
+    to_ = props.get("To", "")
+    frm = props.get("From", "")
+
+    wo_m_disp = props.get("WO_m_display", "")
+    wo_km_disp = props.get("WO_km_display", "")
+
+    route_mode = props.get("route_mode", "")
+    supervisor = props.get("Supervisor", "")
+    district = props.get("District", "")
+    ward = props.get("Ward", "")
+    date = props.get("Date", "")
+    shift = props.get("Shift", "")
+    work_type = props.get("Type", "")
+
+    dump_trucks = props.get("DumpTrucks", "")
+    dump_provider = props.get("DumpTruckProvider", "")
+    loads = props.get("Loads", "")
+    tonnes = props.get("Tonnes", "")
+    side = props.get("Side", "")
+    road_side = props.get("RoadSide", "")
+    snow_dump_site = props.get("SnowDumpSite", "")
+    comments = props.get("Comments", "")
+
+    extra = ""
+    if route_mode:
+        extra = (
+            "<div style='margin-top:6px;padding:6px;border-radius:6px;background:#fff3cd;border:1px solid #ffeeba;'>"
+            f"<b>Routing:</b> {html.escape(str(route_mode))}"
+            "</div>"
+        )
+
+    return f"""
+    <div style="font-family:Arial;font-size:13px;line-height:1.25;">
+      <b>WO:</b> {html.escape(str(wo))}<br>
+      <b>Total Segments:</b> {html.escape(str(total_segments))}<br>
+      <b>Location:</b> {html.escape(str(loc))}<br>
+      <b>To:</b> {html.escape(str(to_))}<br>
+      <b>From:</b> {html.escape(str(frm))}<br>
+      <b>Distance (m):</b> {html.escape(str(wo_m_disp))}<br>
+      <b>Distance (km):</b> {html.escape(str(wo_km_disp))}<br>
+      {extra}
+      <hr style="margin:6px 0;">
+      <b>Supervisor:</b> {html.escape(str(supervisor))}<br>
+      <b>District:</b> {html.escape(str(district))}<br>
+      <b>Ward:</b> {html.escape(str(ward))}<br>
+      <b>Date:</b> {html.escape(str(date))}<br>
+      <b>Shift:</b> {html.escape(str(shift))}<br>
+      <b>Type:</b> {html.escape(str(work_type))}<br>
+      <hr style="margin:6px 0;">
+      <b>Dump Trucks:</b> {html.escape(str(dump_trucks))}<br>
+      <b>Dump Truck Provider:</b> {html.escape(str(dump_provider))}<br>
+      <b>Loads:</b> {html.escape(str(loads))}<br>
+      <b>Tonnes:</b> {html.escape(str(tonnes))}<br>
+      <b>Side:</b> {html.escape(str(side))}<br>
+      <b>Road Side:</b> {html.escape(str(road_side))}<br>
+      <b>Snow Dump Site:</b> {html.escape(str(snow_dump_site))}<br>
+      <b>Comments:</b> {html.escape(str(comments))}<br>
+    </div>
+    """
 
 # =========================================================
 # 4. BUILD EVERYTHING (MAP BUILD)
@@ -1017,6 +1188,48 @@ def build_everything():
             return f"{val:.{decimals}f}"
 
         intersection_accum = {}
+
+        def clean_text(v) -> str:
+            """Safe string: NaN/None -> '' and strip."""
+            try:
+                if pd.isna(v):
+                    return ""
+            except Exception:
+                pass
+            if v is None:
+                return ""
+            return str(v).strip()
+
+        def normalize_wo_id(v) -> str:
+            """
+            WO display normalization:
+            - NaN/None -> ''
+            - 909090.0 -> '909090'
+            - keeps alphanumeric IDs intact
+            """
+            try:
+                if pd.isna(v):
+                    return ""
+            except Exception:
+                pass
+            if v is None:
+                return ""
+
+            # If it's a numeric WO coming in as float, drop .0
+            try:
+                fv = float(v)
+                if math.isfinite(fv) and fv.is_integer():
+                    return str(int(fv))
+            except Exception:
+                pass
+
+            s = str(v).strip()
+            if s.endswith(".0"):
+                head = s[:-2]
+                if head.replace(".", "", 1).isdigit():
+                    return head
+            return s
+
 
         def add_intersection_coord(intersection_id: int, lon: float, lat: float):
             if intersection_id is None:
@@ -1417,23 +1630,31 @@ def build_everything():
             return html.escape(str(shift_raw))
 
         def build_popup_html(row, popup_columns, popup_labels,
-                             supervisor_cell_html, shift_cell_html) -> str:
+                     supervisor_cell_html, shift_cell_html) -> str:
             rows = []
-            for col in popup_columns:
-                label = popup_labels.get(col, col)
-                if col == "Supervisor\n":
+
+            def clean_cell(v):
+                return "" if pd.isna(v) else str(v)
+
+            for form_key in popup_columns:
+                label = popup_labels.get(form_key, form_key)
+
+                # Keep your special formatting for supervisor/shift,
+                # but trigger it based on FORM keys now.
+                if form_key == "Supervisor__NL":
                     cell_html = supervisor_cell_html
-                elif col == "Shift\n":
+                elif form_key == "Shift__NL":
                     cell_html = shift_cell_html
                 else:
-                    val = row.get(col, "")
-                    cell_html = html.escape(str(val))
+                    val = value_for_form_field(row, form_key)
+                    cell_html = html.escape(clean_cell(val))
 
                 rows.append(
                     "<tr><th style='text-align:left;padding-right:6px;'>{}</th><td>{}</td></tr>".format(
                         html.escape(str(label)), cell_html
                     )
                 )
+
             return "<table>" + "".join(rows) + "</table>"
 
         def build_intersection_popup(wo_id, loc_raw, from_raw, to_raw, intersection_id):
@@ -1461,8 +1682,9 @@ def build_everything():
                     f"<b>Routing:</b> {html.escape(str(props.get('route_mode')))}"
                     "</div>"
                 )
-
+    
             return f"""
+            
             <div style="font-family:Arial;font-size:13px;line-height:1.25;">
               <b>WO:</b> {html.escape(str(props.get("WO_ID","")))}<br>
               <b>Total Segments:</b> {html.escape(str(props.get("Segment_count","")))}<br>
@@ -1479,6 +1701,15 @@ def build_everything():
               <b>Date:</b> {html.escape(str(props.get("Date","")))}<br>
               <b>Shift:</b> {shift_html}<br>
               <b>Type:</b> {html.escape(str(props.get("Type","")))}<br>
+              <hr style="margin:6px 0;">
+              <b>Dump Trucks:</b> {html.escape(str(props.get("DumpTrucks","")))}<br>
+              <b>Dump Truck Provider:</b> {html.escape(str(props.get("DumpTruckProvider","")))}<br>
+              <b>Loads:</b> {html.escape(str(props.get("Loads","")))}<br>
+              <b>Tonnes:</b> {html.escape(str(props.get("Tonnes","")))}<br>
+              <b>Side:</b> {html.escape(str(props.get("Side","")))}<br>
+              <b>Road Side:</b> {html.escape(str(props.get("RoadSide","")))}<br>
+              <b>Snow Dump Site:</b> {html.escape(str(props.get("SnowDumpSite","")))}<br>
+              <b>Comments:</b> {html.escape(str(props.get("Comments","")))}<br>
             </div>
             """
 
@@ -1992,19 +2223,9 @@ def build_everything():
             )
             intersections_group.add_to(m)
 
-        popup_columns = [
-            "WO",
-            "District\n",
-            "Ward\n",
-            "Date\n",
-            "Shift\n",
-            "Supervisor\n",
-            "Location",
-            "From ",
-            "To",
-            "Type (Road Class/ School, Bridge)\n",
-        ]
-        popup_labels = {col: col.replace("\n", " ").strip() for col in popup_columns}
+        popup_columns = DISPLAY_FIELDS_FORM[:]  # FORM keys
+        popup_labels = {k: k for k in popup_columns}  # EXACT webform names
+
 
         subsegment_count = 0
         skipped_count = 0
@@ -2081,8 +2302,17 @@ def build_everything():
             street_key, node_path, edge_indices, district_color,
             wo_id, loc_raw, from_raw, to_raw, district_val, ward, date_str, shift_str,
             supervisor_raw, sup_key, work_type, supervisor_link_html, shift_display_html, wo_total_m,
-            route_mode=""
+            route_mode="",
+            dump_trucks="",
+            dump_provider="",
+            loads="",
+            tonnes="",
+            side="",
+            road_side="",
+            snow_dump_site="",
+            comments="",
         ):
+
             if not DRAW_WO_SEGMENTS:
                 return
             if not node_path or len(node_path) < 2 or not edge_indices:
@@ -2103,6 +2333,9 @@ def build_everything():
                 seg_from_label = pick_cross_street(seg["u"], street_key)
                 seg_to_label = pick_cross_street(seg["v"], street_key)
 
+                def clean(v):
+                    return "" if pd.isna(v) else str(v)
+
                 props = {
                     "feature_kind": "workorder_segment",
                     "WO_ID": str(wo_id),
@@ -2117,6 +2350,15 @@ def build_everything():
                     "Supervisor": str(supervisor_raw),
                     "SupervisorKey": str(sup_key),
                     "Type": str(work_type),
+
+                    # ✅ WEBFORM-style DISPLAY fields (NEW)
+                    "WO": str(wo_id),
+                    "District__NL": str(district_val),
+                    "Ward__NL": str(ward),
+                    "Date__NL": str(date_str),
+                    "Shift__NL": str(shift_str),
+                    "Supervisor__NL": str(supervisor_raw).strip(),
+                    "Type__NL": str(work_type),
 
                     "From_Intersection_ID": int(seg["u"]),
                     "To_Intersection_ID": int(seg["v"]),
@@ -2139,7 +2381,14 @@ def build_everything():
                     "Supervisor_link_html": supervisor_link_html,
                     "Shift_html": shift_display_html,
                     "route_mode": route_mode,
-
+                    "DumpTrucks": clean(dump_trucks),
+                    "DumpTruckProvider": clean(dump_provider),
+                    "Loads": clean(loads),
+                    "Tonnes": clean(tonnes),
+                    "Side": clean(side),
+                    "RoadSide": clean(road_side),
+                    "SnowDumpSite": clean(snow_dump_site),
+                    "Comments": clean(comments),
                     "stroke_color": str(district_color),
                 }
 
@@ -2211,21 +2460,20 @@ def build_everything():
         def add_line_feature(row, wo_id, geometry, color, district_val, ward_val, date_val, shift_val,
                              supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
                              loc_key=None, from_key=None, to_key=None, route_mode=""):
-            popup_html = build_popup_html(
-                row, popup_columns, popup_labels,
-                make_supervisor_link(supervisor_raw, sup_key),
-                format_shift_with_icons(row.get("Shift\n", ""))
-            )
 
             props = {
                 "feature_kind": "workorder_line",
-                "WO_ID": wo_id,
+                "WO_ID": normalize_wo_id(wo_id),
+
+                # Raw values used in geometry & routing
                 "Location": str(loc_raw),
                 "From": str(from_raw),
                 "To": str(to_raw),
                 "Location_resolved": loc_key,
                 "From_resolved": from_key,
                 "To_resolved": to_key,
+
+                # MASTER-style fields (KEEP – existing logic depends on these)
                 "District": district_val,
                 "Ward": ward_val,
                 "Date": date_val,
@@ -2233,9 +2481,29 @@ def build_everything():
                 "Supervisor": str(supervisor_raw).strip(),
                 "SupervisorKey": sup_key,
                 "Type": type_val,
+
+                # ✅ WEBFORM-style DISPLAY fields (NEW – used by popup/tooltips)
+                "WO": normalize_wo_id(wo_id),
+                "District__NL": str(district_val),
+                "Ward__NL": str(ward_val),
+                "Date__NL": str(date_val),
+                "Shift__NL": str(shift_val),
+                "Supervisor__NL": str(supervisor_raw).strip(),
+                "Type__NL": str(type_val),
+                # --- NEW: equipment fields (from the same row that created this WO) ---
+                "DumpTrucks": clean_text(row.get("# of Equipment (Dump Trucks)", "")),
+                "DumpTruckProvider": clean_text(row.get("Dump Truck Provider Contractor", "")),
+                "Loads": clean_text(row.get("# of Loads", "")),
+                "Tonnes": clean_text(row.get("Tonnes", "")),
+                "Side": clean_text(row.get("One Side/ Both Sides", "")),
+                "RoadSide": clean_text(row.get("Side of Road Cleared", "")),
+                "SnowDumpSite": clean_text(row.get("Snow Dumped Site", "")),
+                "Comments": clean_text(row.get("Comments", "")),
+
                 "stroke_color": color,
                 "route_mode": route_mode,
             }
+
 
             feature = {"type": "Feature", "geometry": geometry, "properties": props}
             geojson_features.append(feature)
@@ -2252,21 +2520,27 @@ def build_everything():
             )
 
             tooltip = folium.GeoJsonTooltip(
-                fields=["WO_ID", "Location", "From", "To", "District", "Supervisor", "Date", "Shift"],
-                aliases=["WO", "Location", "From", "To", "District", "Supervisor", "Date", "Shift"],
+                fields=["WO_ID", "Location", "From", "To", "District__NL", "Supervisor__NL", "Date__NL", "Shift__NL"],
+                aliases=["WO", "Location", "From", "To", "District__NL", "Supervisor__NL", "Date__NL", "Shift__NL"],
                 sticky=False,
             )
+
             tooltip.add_to(gj)
 
+            # ✅ ALWAYS define popup_html first
+            popup_html = build_workorder_popup(props)
+
+            # Optional: append routing note safely (only if route_mode exists)
             if route_mode:
                 popup_html = popup_html.replace(
                     "</table>",
                     f"</table><div style='margin-top:8px;padding:6px;border-radius:6px;background:#fff3cd;border:1px solid #ffeeba;'>"
-                    f"<b>Routing:</b> {html.escape(route_mode)}</div>"
+                    f"<b>Routing:</b> {html.escape(str(route_mode))}</div>"
                 )
 
             folium.Popup(popup_html, max_width=420).add_to(gj)
             gj.add_to(work_orders_group)
+
 
         for _, row in master.iterrows():
             row_dict = row.to_dict()
@@ -2482,6 +2756,14 @@ def build_everything():
                 supervisor_link_html=make_supervisor_link(supervisor_raw, sup_key),
                 shift_display_html=format_shift_with_icons(row.get("Shift\n", "")),
                 wo_total_m=wo_total_m,
+                dump_trucks=row.get("# of Equipment (Dump Trucks)", ""),
+                dump_provider=row.get("Dump Truck Provider Contractor", ""),
+                loads=row.get("# of Loads", ""),
+                tonnes=row.get("Tonnes", ""),
+                side=row.get("One Side/ Both Sides", ""),
+                road_side=row.get("Side of Road Cleared", ""),
+                snow_dump_site=row.get("Snow Dumped Site", ""),
+                comments=row.get("Comments", ""),
                 route_mode="Exact Location found and Mapped"
             )
 
@@ -2755,19 +3037,51 @@ NEW_FORM_HTML = """
     <table style="margin-top:10px;">
       <thead>
         <tr>
-          <th>WO</th><th>Location</th><th>From</th><th>To</th><th>District</th><th>Ward</th><th>Status</th><th>Edit</th>
+            <th>WO</th>
+            <th>Date</th>
+            <th>District</th>
+            <th>Ward</th>
+            <th>Supervisor</th>
+            <th>Shift</th>
+            <th>Type</th>
+            <th>Dump Trucks</th>
+            <th>Dump Truck Provider</th>
+            <th>Loads</th>
+            <th>Tonnes</th>
+            <th>Side</th>
+            <th>Road Side</th>
+            <th>Snow Dump Site</th>
+            <th>Comments</th>
+            <th>Location</th>
+            <th>From</th>
+            <th>To</th>
+            <th>Status</th>
+            <th>Edit</th>
         </tr>
       </thead>
       <tbody>
       {% for r in batch %}
         <tr>
           <td>{{ r.get('WO','') }}</td>
+          <td>{{ r.get('Date\\n','') }}</td>
+          <td>{{ r.get('District\\n','') }}</td>
+          <td>{{ r.get('Ward\\n','') }}</td>
+          <td>{{ r.get('Supervisor\\n','') }}</td>
+          <td>{{ r.get('Shift\\n','') }}</td>
+          <td>{{ r.get('Type (Road Class/ School, Bridge)\\n','') }}</td>
+          <td>{{ r.get('# of Equipment (Dump Trucks)','') }}</td>
+          <td>{{ r.get('Dump Truck Provider Contractor','') }}</td>
+          <td>{{ r.get('# of Loads','') }}</td>
+          <td>{{ r.get('Tonnes','') }}</td>
+          <td>{{ r.get('One Side/ Both Sides','') }}</td>
+          <td>{{ r.get('Side of Road Cleared','') }}</td>
+          <td>{{ r.get('Snow Dumped Site','') }}</td>
+          <td style="max-width:220px;">{{ r.get('Comments','') }}</td>
           <td>{{ r.get('Location','') }}</td>
           <td>{{ r.get('From ','') }}</td>
           <td>{{ r.get('To','') }}</td>
-          <td>{{ r.get('District\\n','') }}</td>
-          <td>{{ r.get('Ward\\n','') }}</td>
           <td><code>{{ r.get('__status','') }}</code></td>
+
           <td>
             {% if (r.get('__status','')|upper) == 'PENDING' %}
               <a href="/edit/{{ r.get('__submission_id','') }}">Edit</a>
@@ -2817,6 +3131,7 @@ NEW_FORM_HTML = """
             <th style="width:140px;">Side</th>
             <th style="width:160px;">Road Side</th>
             <th style="width:180px;">Snow Dump Site</th>
+            <th style="width:260px;">Comments</th>
             <th>Location</th>
             <th>From</th>
             <th>To</th>
@@ -2933,6 +3248,9 @@ NEW_FORM_HTML = """
       +   '<option value="">--</option>'
       +   snowDumpSitesOptions
       + '</select></td>'
+      + '<td><textarea name="Comments_' + idx + '" rows="2" '
+      +   'style="width:100%;padding:9px 10px;border-radius:10px;border:1px solid #ccc;font-size:14px;resize:vertical;" '
+      +   'placeholder="Notes / comments (optional)"></textarea></td>'
       + '<td><input name="Location_' + idx + '" list="streets" required placeholder="Location"></td>'
       + '<td><input name="From_' + idx + '" list="streets" placeholder="From"></td>'
       + '<td><input name="To_' + idx + '" list="streets" placeholder="To"></td>'
@@ -3112,6 +3430,50 @@ EDIT_FORM_HTML = """
         <option value="{{ t }}" {% if row.get('Type (Road Class/ School, Bridge)\\n','') == t %}selected{% endif %}>{{ t }}</option>
         {% endfor %}
       </select>
+      
+      <label>Dump Trucks</label>
+      <input name="# of Equipment (Dump Trucks)" value="{{ row.get('# of Equipment (Dump Trucks)','') }}"/>
+
+
+      <label>Dump Truck Provider</label>
+      <select name="Dump Truck Provider Contractor">
+        <option value="">--</option>
+        {% for x in dump_truck_providers %}
+        <option value="{{ x }}" {% if row.get('Dump Truck Provider Contractor','') == x %}selected{% endif %}>{{ x }}</option>
+        {% endfor %}
+      </select>
+
+      <label>Loads</label>
+      <input name="# of Loads" value="{{ row.get('# of Loads','') }}"/>
+
+      <label>Tonnes</label>
+      <input name="Tonnes" value="{{ row.get('Tonnes','') }}"/>
+
+      <label>Side</label>
+      <select name="One Side/ Both Sides">
+        <option value="">--</option>
+        <option {% if row.get('One Side/ Both Sides')=='Both Sides' %}selected{% endif %}>Both Sides</option>
+        <option {% if row.get('One Side/ Both Sides')=='One Side' %}selected{% endif %}>One Side</option>
+      </select>
+
+      <label>Road Side</label>
+      <select name="Side of Road Cleared">
+        <option value="">--</option>
+        {% for s in ['North','South','East','West','East/West','North/South'] %}
+        <option {% if row.get('Side of Road Cleared')==s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+
+      <label>Snow Dump Site</label>
+      <select name="Snow Dumped Site">
+        <option value="">--</option>
+        {% for s in snow_dump_sites %}
+        <option {% if row.get('Snow Dumped Site')==s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+
+      <label>Comments</label>
+      <textarea name="Comments" rows="3">{{ row.get('Comments','') }}</textarea>
 
       <label>Location</label>
       <input name="Location" required value="{{ row.get('Location','') }}"/>
@@ -3242,7 +3604,7 @@ def new_submit():
         values["One Side/ Both Sides"] = form.get(f"One Side/ Both Sides_{idx}", "")
         values["Side of Road Cleared"] = form.get(f"Side of Road Cleared_{idx}", "")
         values["Snow Dumped Site"] = form.get(f"Snow Dumped Site_{idx}", "")
-
+        values["Comments"] = form.get(f"Comments_{idx}", "")
         values["Date\n"] = format_date_from_picker(values.get("Date\n", ""))
 
         # Skip fully empty accidental rows (but keep strict required)
@@ -3340,6 +3702,8 @@ def edit_form(sid):
         supervisors=latest_allowed_sets.get("Supervisor\n", []),
         shifts=latest_allowed_sets.get("Shift\n", []),
         types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
+        dump_truck_providers=DUMP_TRUCK_PROVIDERS,
+        snow_dump_sites=SNOW_DUMP_SITES,        
     )
 
 
@@ -3367,6 +3731,8 @@ def edit_submit(sid):
             supervisors=latest_allowed_sets.get("Supervisor\n", []),
             shifts=latest_allowed_sets.get("Shift\n", []),
             types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
+            dump_truck_providers=DUMP_TRUCK_PROVIDERS,
+            snow_dump_sites=SNOW_DUMP_SITES,
         )
 
     form = request.form.to_dict()
@@ -3377,6 +3743,15 @@ def edit_submit(sid):
 
     # Date: allow both picker format and already-formatted
     values["Date\n"] = format_date_from_picker(values.get("Date\n", ""))
+    values["# of Equipment (Dump Trucks)"] = form.get("# of Equipment (Dump Trucks)", "")
+    values["Dump Truck Provider Contractor"] = form.get("Dump Truck Provider Contractor", "")
+    values["# of Loads"] = form.get("# of Loads", "")
+    values["Tonnes"] = form.get("Tonnes", "")
+    values["One Side/ Both Sides"] = form.get("One Side/ Both Sides", "")
+    values["Side of Road Cleared"] = form.get("Side of Road Cleared", "")
+    values["Snow Dumped Site"] = form.get("Snow Dumped Site", "")
+    values["Comments"] = form.get("Comments", "")
+
 
     streets_set = set(
         s.upper().strip()
@@ -3400,6 +3775,8 @@ def edit_submit(sid):
             supervisors=latest_allowed_sets.get("Supervisor\n", []),
             shifts=latest_allowed_sets.get("Shift\n", []),
             types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
+            dump_truck_providers=DUMP_TRUCK_PROVIDERS,
+            snow_dump_sites=SNOW_DUMP_SITES,
         )
 
     ok = update_intake_row(sid, values)

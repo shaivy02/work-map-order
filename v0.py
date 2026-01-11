@@ -2052,6 +2052,66 @@ def build_everything():
         """
         m.get_root().html.add_child(folium.Element(geocoder_style))
 
+                # ---------------------------------------------------------
+        # ✅ Remove Leaflet's default "blue focus box" on click,
+        #    and add a slow strobe/pulse on the clicked segment only
+        # ---------------------------------------------------------
+        wo_click_fx_css = """
+        <style>
+          /* Leaflet (SVG) can show a blue focus outline rectangle after click */
+          .leaflet-container .leaflet-interactive:focus {
+            outline: none !important;
+          }
+
+          /* Clicked segment pulse (keeps original stroke color) */
+          .leaflet-container .leaflet-interactive.wo-active {
+            outline: none !important;
+            animation: woPulse 1.6s ease-in-out infinite;
+          }
+
+          @keyframes woPulse {
+            0%   { stroke-opacity: 1;    stroke-width: 10; }
+            50%  { stroke-opacity: 0.35; stroke-width: 6; }
+            100% { stroke-opacity: 1;    stroke-width: 10; }
+          }
+        </style>
+        """
+        m.get_root().html.add_child(folium.Element(wo_click_fx_css))
+
+        wo_click_fx_js = f"""
+        <script>
+          (function() {{
+            function activateTarget(t) {{
+              // remove from any previous active path
+              document.querySelectorAll('.leaflet-interactive.wo-active').forEach(function(el) {{
+                el.classList.remove('wo-active');
+              }});
+
+              if (!t || !t.classList) return;
+              if (!t.classList.contains('leaflet-interactive')) return;
+
+              // prevent focus outline + apply pulse class
+              try {{
+                t.setAttribute('tabindex', '-1');
+                if (typeof t.blur === 'function') t.blur();
+              }} catch (e) {{}}
+
+              t.classList.add('wo-active');
+            }}
+
+            var map = {m.get_name()};
+            if (!map || !map.on) return;
+
+            map.on('click', function(e) {{
+              var t = e && e.originalEvent ? e.originalEvent.target : null;
+              activateTarget(t);
+            }});
+          }})();
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(wo_click_fx_js))
+
+
         map_var = m.get_name()
         toronto_viewbox = "-79.65,43.55,-79.10,43.86"
 
