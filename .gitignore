@@ -33,3 +33,6 @@ docs/work_orders_map.html
 .DS_Store
 !Centreline - Version 2 - 4326.csv
 
+requests
+certifi
+
