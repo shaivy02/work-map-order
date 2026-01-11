@@ -854,45 +854,6 @@ def apply_intake_to_master():
         log(f"INTAKE APPLY: applied {applied} new row(s) into MASTER_TRACKER.")
         return applied, applied_items
 
-def build_segment_popup(props: dict) -> str:
-    wo_m_str = props.get("WO_m_display", "")
-    wo_km_str = props.get("WO_km_display", "")
-    sup_html = props.get("Supervisor_link_html", html.escape(str(props.get("Supervisor", ""))))
-    shift_html = props.get("Shift_html", html.escape(str(props.get("Shift", ""))))
-
-    extra = ""
-    if props.get("route_mode"):
-        extra = (
-            "<div style='margin-top:6px;padding:6px;border-radius:6px;background:#fff3cd;border:1px solid #ffeeba;'>"
-            f"<b>Routing:</b> {html.escape(str(props.get('route_mode')))}"
-            "</div>"
-        )
-
-    # NOTE: This is a SEGMENT popup; include segment fields if you want.
-    seg_idx = props.get("Segment_idx", "")
-    total_segments = props.get("Total_Segments", "")
-
-    loc = props.get("Location", "")
-    to_ = props.get("To", "")
-    frm = props.get("From", "")
-
-    return f"""
-    <div style="font-family:Arial;font-size:13px;line-height:1.25;">
-      <b>WO:</b> {html.escape(str(props.get("WO", "")))}<br>
-      <b>Segment:</b> {html.escape(str(seg_idx))}<br>
-      <b>Total Segments:</b> {html.escape(str(total_segments))}<br>
-      <b>Location:</b> {html.escape(str(loc))}<br>
-      <b>To:</b> {html.escape(str(to_))}<br>
-      <b>From:</b> {html.escape(str(frm))}<br>
-      <b>Distance (m):</b> {html.escape(str(wo_m_str))}<br>
-      <b>Distance (km):</b> {html.escape(str(wo_km_str))}<br>
-      {extra}
-      <hr style="margin:6px 0;">
-      <b>Supervisor:</b> {sup_html}<br>
-      <b>Shift:</b> {shift_html}<br>
-    </div>
-    """
-
 def build_workorder_popup(props: dict) -> str:
     wo = props.get("WO", "")
     total_segments = props.get("Total_Segments", "")
@@ -1350,6 +1311,26 @@ def build_everything():
             [s for s in street_nodes.keys() if isinstance(s, str) and s.strip()],
             key=lambda x: x.casefold()
         )
+
+        # ---------------------------------------------------------
+        # UI helper: Location → Cross-streets lookup (for /new form)
+        # ---------------------------------------------------------
+        # For each centreline street key, precompute the set of other streets that
+        # intersect it at any node. This powers the "To/From" dependent picklists.
+        street_to_cross = {}
+        for _s, _nodes in street_nodes.items():
+            try:
+                _cross = set()
+                for _nid in _nodes:
+                    _cross.update(intersection_to_streets.get(int(_nid), set()))
+                _cross.discard(_s)
+                street_to_cross[_s] = sorted(
+                    [x for x in _cross if x and isinstance(x, str)],
+                    key=lambda x: x.casefold()
+                )
+            except Exception:
+                street_to_cross[_s] = []
+
 
         TYPE_TOKENS = {
             " STREET", " AVENUE", " ROAD", " BOULEVARD",
@@ -2052,68 +2033,68 @@ def build_everything():
         """
         m.get_root().html.add_child(folium.Element(geocoder_style))
 
-                # ---------------------------------------------------------
+        # ---------------------------------------------------------
         # ✅ Remove Leaflet's default "blue focus box" on click,
         #    and add a slow strobe/pulse on the clicked segment only
         # ---------------------------------------------------------
         wo_click_fx_css = """
-        <style>
-          /* Leaflet (SVG) can show a blue focus outline rectangle after click */
-          .leaflet-container .leaflet-interactive:focus {
-            outline: none !important;
-          }
+<style>
+  /* Leaflet (SVG) can show a blue focus outline rectangle after click */
+  .leaflet-container .leaflet-interactive:focus {
+    outline: none !important;
+  }
 
-          /* Clicked segment pulse (keeps original stroke color) */
-          .leaflet-container .leaflet-interactive.wo-active {
-            outline: none !important;
-            animation: woPulse 1.6s ease-in-out infinite;
-          }
+  /* Clicked segment pulse (keeps original stroke color) */
+  .leaflet-container .leaflet-interactive.wo-active {
+    outline: none !important;
+    animation: woPulse 1.6s ease-in-out infinite;
+  }
 
-          @keyframes woPulse {
-            0%   { stroke-opacity: 1;    stroke-width: 10; }
-            50%  { stroke-opacity: 0.35; stroke-width: 6; }
-            100% { stroke-opacity: 1;    stroke-width: 10; }
-          }
-        </style>
-        """
+  @keyframes woPulse {
+    0%   { stroke-opacity: 1;    stroke-width: 10; }
+    50%  { stroke-opacity: 0.35; stroke-width: 6; }
+    100% { stroke-opacity: 1;    stroke-width: 10; }
+  }
+</style>
+"""
         m.get_root().html.add_child(folium.Element(wo_click_fx_css))
 
         wo_click_fx_js = f"""
-        <script>
-          (function() {{
-            function activateTarget(t) {{
-              // remove from any previous active path
-              document.querySelectorAll('.leaflet-interactive.wo-active').forEach(function(el) {{
-                el.classList.remove('wo-active');
-              }});
+<script>
+  (function() {{
+    function activateTarget(t) {{
+      // remove from any previous active path
+      document.querySelectorAll('.leaflet-interactive.wo-active').forEach(function(el) {{
+        el.classList.remove('wo-active');
+      }});
 
-              if (!t || !t.classList) return;
-              if (!t.classList.contains('leaflet-interactive')) return;
+      if (!t || !t.classList) return;
+      if (!t.classList.contains('leaflet-interactive')) return;
 
-              // prevent focus outline + apply pulse class
-              try {{
-                t.setAttribute('tabindex', '-1');
-                if (typeof t.blur === 'function') t.blur();
-              }} catch (e) {{}}
+      // prevent focus outline + apply pulse class
+      try {{
+        t.setAttribute('tabindex', '-1');
+        if (typeof t.blur === 'function') t.blur();
+      }} catch (e) {{}}
 
-              t.classList.add('wo-active');
-            }}
+      t.classList.add('wo-active');
+    }}
 
-            var map = {m.get_name()};
-            if (!map || !map.on) return;
+    var map = {m.get_name()};
+    if (!map || !map.on) return;
 
-            map.on('click', function(e) {{
-              var t = e && e.originalEvent ? e.originalEvent.target : null;
-              activateTarget(t);
-            }});
-          }})();
-        </script>
-        """
+    map.on('click', function(e) {{
+      var t = e && e.originalEvent ? e.originalEvent.target : null;
+      activateTarget(t);
+    }});
+  }})();
+</script>
+"""
         m.get_root().html.add_child(folium.Element(wo_click_fx_js))
-
 
         map_var = m.get_name()
         toronto_viewbox = "-79.65,43.55,-79.10,43.86"
+
 
         add_geocoder_control = f"""
         <script>
@@ -2926,7 +2907,10 @@ def build_everything():
             "skipped": int(skipped_count),
             "centre_streets_count": int(len(ALL_CENTRE_STREETS)),
             "centre_streets": ALL_CENTRE_STREETS,
+            "street_to_cross_count": int(len(street_to_cross)),
+            "street_to_cross": street_to_cross,
         }
+
 
 
 def format_date_from_picker(val: str) -> str:
@@ -2947,7 +2931,9 @@ app = Flask(__name__)
 events = Queue()
 latest_build_stats = {"status": "not built yet"}
 latest_centre_streets = []
+latest_street_to_cross = {}
 latest_allowed_sets = {}
+
 
 INDEX_HTML = """
 <!doctype html>
@@ -3224,6 +3210,8 @@ NEW_FORM_HTML = """
     </form>
   </div>
 
+<div id="crossLists" style="display:none;"></div>
+
 <script>
 (function(){
   var districts = {{ districts_json | safe }};
@@ -3236,6 +3224,35 @@ NEW_FORM_HTML = """
 
   var tbody = document.getElementById('woTbody');
   var addBtn = document.getElementById('addRowBtn');
+  var crossListsHost = document.getElementById('crossLists');
+
+  function populateDatalist(dl, arr, excludeVal){
+    if (!dl) return;
+    var ex = (excludeVal || '').toString().trim().toUpperCase();
+    dl.innerHTML = '';
+    (arr || []).forEach(function(s){
+      var v = (s || '').toString();
+      if (!v) return;
+      if (ex && v.toUpperCase() === ex) return;
+      var opt = document.createElement('option');
+      opt.value = v;
+      dl.appendChild(opt);
+    });
+  }
+
+  async function fetchCrossStreets(locationVal){
+    var loc = (locationVal || '').toString().trim();
+    if (!loc) return { matched_location: "", cross_streets: [] };
+    try{
+      var resp = await fetch('/api/cross_streets?location=' + encodeURIComponent(loc));
+      if(!resp.ok) throw new Error('bad resp');
+      return await resp.json();
+    }catch(e){
+      return { matched_location: "", cross_streets: [] };
+    }
+  }
+
+  
 
   function optList(arr){
     return (arr || []).map(function(x){
@@ -3311,12 +3328,49 @@ NEW_FORM_HTML = """
       + '<td><textarea name="Comments_' + idx + '" rows="2" '
       +   'style="width:100%;padding:9px 10px;border-radius:10px;border:1px solid #ccc;font-size:14px;resize:vertical;" '
       +   'placeholder="Notes / comments (optional)"></textarea></td>'
-      + '<td><input name="Location_' + idx + '" list="streets" required placeholder="Location"></td>'
-      + '<td><input name="From_' + idx + '" list="streets" placeholder="From"></td>'
-      + '<td><input name="To_' + idx + '" list="streets" placeholder="To"></td>'
+      + '<td><input class="locIn" name="Location_' + idx + '" list="streets" required placeholder="Location"></td>'
+      + '<td><input class="fromIn" name="From_' + idx + '" placeholder="From (cross street)"></td>'
+      + '<td><input class="toIn" name="To_' + idx + '" placeholder="To (cross street)"></td>'
       + '<td><button type="button" class="ghost rmBtn">Remove</button></td>';
 
     tbody.appendChild(tr);
+
+    // --- Location → To/From dependent lists (cross streets) ---
+    var locIn = tr.querySelector('.locIn');
+    var toIn = tr.querySelector('.toIn');
+    var fromIn = tr.querySelector('.fromIn');
+
+    var dlTo = document.createElement('datalist');
+    dlTo.id = 'cross_to_' + idx;
+    dlTo.setAttribute('data-crosslist','1');
+    crossListsHost.appendChild(dlTo);
+    toIn.setAttribute('list', dlTo.id);
+
+    var dlFrom = document.createElement('datalist');
+    dlFrom.id = 'cross_from_' + idx;
+    dlFrom.setAttribute('data-crosslist','1');
+    crossListsHost.appendChild(dlFrom);
+    fromIn.setAttribute('list', dlFrom.id);
+
+    var cachedCross = [];
+
+    async function refreshCrossLists(){
+    var data = await fetchCrossStreets(locIn.value);
+    cachedCross = (data && data.cross_streets) ? data.cross_streets : [];
+    populateDatalist(dlTo, cachedCross, fromIn.value);
+    populateDatalist(dlFrom, cachedCross, toIn.value);
+    }
+
+    locIn.addEventListener('change', refreshCrossLists);
+    locIn.addEventListener('blur', refreshCrossLists);
+
+    toIn.addEventListener('change', function(){
+    populateDatalist(dlFrom, cachedCross, toIn.value);
+    });
+    fromIn.addEventListener('change', function(){
+    populateDatalist(dlTo, cachedCross, fromIn.value);
+    });
+
 
     var rm = tr.querySelector('.rmBtn');
     rm.onclick = function(){
@@ -3742,6 +3796,62 @@ def new_submit():
         {"Location": f"/new?bid={batch_id}"}
     )
 
+@app.get("/api/cross_streets")
+def api_cross_streets():
+    """Return cross-street suggestions that intersect a given Location street."""
+    auth_resp = require_auth_or_401()
+    if auth_resp:
+        return auth_resp
+
+    loc_raw = (request.args.get("location") or "").strip()
+
+    def _ui_norm(s: str) -> str:
+        s = (s or "").upper().strip()
+        s = s.replace("-", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    loc_key = _ui_norm(loc_raw)
+
+    streets = latest_centre_streets or []
+    street_set = set(streets)
+
+    matched = ""
+    if loc_key in street_set:
+        matched = loc_key
+    else:
+        # Cheap best-effort matching
+        # 1) substring
+        for st in streets:
+            if loc_key and loc_key in st:
+                matched = st
+                break
+        # 2) difflib fallback
+        if not matched and loc_key:
+            try:
+                close = difflib.get_close_matches(loc_key, streets, n=1, cutoff=0.72)
+                if close:
+                    matched = close[0]
+            except Exception:
+                pass
+
+    cross = list(latest_street_to_cross.get(matched, []) or [])
+    return Response(
+        json.dumps(
+            {
+                "input_location": loc_raw,
+                "matched_location": matched,
+                "count": len(cross),
+                "cross_streets": cross,
+            },
+            ensure_ascii=False,
+        ),
+        mimetype="application/json",
+    )
+
+
+
+
 @app.get("/edit/<sid>")
 def edit_form(sid):
     auth_resp = require_auth_or_401()
@@ -4016,7 +4126,7 @@ def _emit_updated_event(kind: str, items=None):
 
 
 def watcher_loop():
-    global latest_build_stats, latest_centre_streets, latest_allowed_sets
+    global latest_build_stats, latest_centre_streets, latest_street_to_cross, latest_allowed_sets
 
     last_fp = file_fingerprint(MASTER_TRACKER_PATH)
 
@@ -4025,6 +4135,7 @@ def watcher_loop():
             stats = build_everything()
         latest_allowed_sets = recompute_allowed_sets_from_master()
         latest_centre_streets = stats.get("centre_streets", [])
+        latest_street_to_cross = stats.get("street_to_cross", {})
         latest_build_stats = {
             "status": "ready",
             "last_build": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -4102,6 +4213,7 @@ def intake_poll_loop():
                     stats = build_everything()
                 latest_allowed_sets = recompute_allowed_sets_from_master()
                 latest_centre_streets = stats.get("centre_streets", [])
+                latest_street_to_cross = stats.get("street_to_cross", {})
                 latest_build_stats = {
                     "status": "ready",
                     "last_build": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
