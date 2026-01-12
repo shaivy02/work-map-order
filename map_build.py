@@ -169,13 +169,75 @@ STRICT_DISTRICTS = []
 STRICT_WARDS = []
 STRICT_SUPERVISORS = []
 STRICT_SHIFTS = []
-STRICT_TYPES = []
+STRICT_TYPES = [
+    # Base road classes
+    "Expressway",
+    "MSSR Arterial",
+    "Arterial",
+    "Collector",
+    "Local",
+    "Road",
+
+    # Road class + features
+    "Arterial, Bike Lane",
+    "Arterial, Bridge",
+    "Arterial, Intersection",
+    "Arterial, Sidewalks",
+    "Arterial, Sidewalks, Bike Lane",
+    "Arterial, Sidewalks, Bridge",
+    "Arterial, Sidewalks, Bridge, Bike Lane",
+
+    "Collector, Bike Lane",
+    "Collector, Bridge",
+    "Collector, Sidewalks",
+    "Collector, Sidewalks, Bike Lane",
+    "Collector, Sidewalks, Bridge",
+    "Collector, TTC Station",
+
+    "Local, Collector",
+    "Local, Sidewalks",
+    "Local, Sidewalks, Bike Lane",
+    "Local, School Zone",
+    "Local, ROW BL",
+    "Local, Priority Hills",
+
+    "MSSR Arterial, Sidewalks",
+    "MSSR Arterial, Bike Lane",
+    "MSSR Arterial, Sidewalks, Bike Lane",
+    "MSSR Arterial, Streetcar",
+    "MSSR Arterial, Streetcar, Bike Lane",
+
+    # Standalone operational categories
+    "Bike Lane",
+    "Bridge",
+    "Sidewalks",
+    "School Zone",
+    "School",
+    "Intersection",
+    "Crosswalk",
+    "Bus Stop",
+    "Bus Bay",
+    "Catch Basins",
+    "Cul-de-sac",
+    "Dead End",
+    "Driveway",
+    "EMS Station",
+    "Sidewalk Obstructions",
+    "Sidewalk Opening",
+    "Sidewalk Snow Piles",
+    "Pile at Intersection",
+    "Pile Collection",
+    "Voting Location",
+]
+
 
 FILE_LOCK = threading.RLock()
 BUILD_LOCK = threading.Lock()
 
 LAST_MASTER_WRITE_BY_INTAKE_AT = 0.0
 LAST_MASTER_WRITE_LOCK = threading.Lock()
+LAST_MASTER_FP_WRITTEN_BY_INTAKE = None
+
 
 # Last applied intake batch (for UI announcements)
 LAST_INTAKE_APPLIED_LOCK = threading.Lock()
@@ -487,8 +549,17 @@ def validate_submission(values: dict, allowed_sets: dict, streets_set: set):
     check_allowed("District\n", "District")
     check_allowed("Ward\n", "Ward")
     check_allowed("Supervisor\n", "Supervisor", allow_custom=True)
-    check_allowed("Shift\n", "Shift")
+
+    # Shift is now a standardized time range, not a fixed dropdown list
+    shift_norm = normalize_shift_time_range(values.get("Shift\n", ""))
+    if normalize_blank(values.get("Shift\n", "")) and not shift_norm:
+        errors.append("Shift must be a valid time range (e.g., 06:30AM - 06:30PM).")
+    else:
+        # store normalized for later (routes will set it too; this is just validation)
+        pass
+
     check_allowed("Type (Road Class/ School, Bridge)\n", "Type")
+
 
     def norm_street_for_check(s: str) -> str:
         return re.sub(r"\s+", " ", str(s).upper().strip())
@@ -760,13 +831,15 @@ def get_intake_submission_details(submission_id: str) -> dict:
 
 
 def apply_intake_to_master():
+
     """
     Applies any new intake submissions to MASTER_TRACKER_PATH.
 
     Returns:
         (applied_count: int, applied_items: list[dict])
     """
-    global LAST_MASTER_WRITE_BY_INTAKE_AT
+    global LAST_MASTER_WRITE_BY_INTAKE_AT, LAST_MASTER_FP_WRITTEN_BY_INTAKE
+
 
     ensure_intake_file()
     ensure_master_has_columns()
@@ -869,6 +942,8 @@ def apply_intake_to_master():
 
         with LAST_MASTER_WRITE_LOCK:
             LAST_MASTER_WRITE_BY_INTAKE_AT = time.time()
+            LAST_MASTER_FP_WRITTEN_BY_INTAKE = file_fingerprint(MASTER_TRACKER_PATH)
+
 
         after = len(master)
         applied = after - before
@@ -2943,6 +3018,89 @@ def format_date_from_picker(val: str) -> str:
         return dt.strftime("%-d-%b-%y")
     except Exception:
         return val
+    
+def _parse_time_token(tok: str):
+    """
+    Accepts:
+      - '18:30'
+      - '6:30pm', '6:30 PM'
+      - '6pm', '6 PM'
+      - '06:30AM'
+    Returns (hour24, minute) or None.
+    """
+    if tok is None:
+        return None
+    s = str(tok).strip()
+    if not s:
+        return None
+
+    s = re.sub(r"\s+", "", s).upper()
+
+    # 24h HH:MM
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return (hh, mm)
+        return None
+
+    # 12h H(:MM)?(AM|PM)
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?(AM|PM)$", s)
+    if m:
+        h12 = int(m.group(1))
+        mm = int(m.group(2) or "00")
+        ap = m.group(3)
+        if not (1 <= h12 <= 12 and 0 <= mm <= 59):
+            return None
+        hh = h12 % 12
+        if ap == "PM":
+            hh += 12
+        return (hh, mm)
+
+    return None
+
+
+def _fmt_hhmm_ampm(hh24: int, mm: int) -> str:
+    # Always 2-digit hour as requested (hh:mmAM/PM)
+    ap = "AM" if hh24 < 12 else "PM"
+    h12 = hh24 % 12
+    if h12 == 0:
+        h12 = 12
+    return f"{h12:02d}:{mm:02d}{ap}"
+
+
+def normalize_shift_time_range(raw: str, start_24: str = "", end_24: str = "") -> str:
+    """
+    Returns standardized: 'hh:mmAM - hh:mmPM'
+    Input can be:
+      - start_24='HH:MM' + end_24='HH:MM'  (from <input type=time>)
+      - raw like '06:30AM - 06:30PM' or '6:30pm-6:30pm' or '18:30-06:30'
+    """
+    # Preferred: two time inputs
+    if start_24 and end_24:
+        a = _parse_time_token(start_24)
+        b = _parse_time_token(end_24)
+        if a and b:
+            return f"{_fmt_hhmm_ampm(a[0], a[1])} - {_fmt_hhmm_ampm(b[0], b[1])}"
+
+    # Fallback: parse raw range
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    # normalize dash variants
+    s2 = s.replace("–", "-").replace("—", "-")
+    parts = [p.strip() for p in s2.split("-") if p.strip()]
+    if len(parts) >= 2:
+        a = _parse_time_token(parts[0])
+        b = _parse_time_token(parts[1])
+        if a and b:
+            return f"{_fmt_hhmm_ampm(a[0], a[1])} - {_fmt_hhmm_ampm(b[0], b[1])}"
+
+    # If user typed a single token (rare), treat as invalid (force range)
+    return ""
+
+
 
 # =========================================================
 # 5. LIVE SERVER + SSE EVENTS + DATA ENTRY UI
@@ -3110,7 +3268,7 @@ INDEX_HTML = """
       <a href="/outputs/work_orders_map.html" target="_blank" rel="noopener noreferrer">work_orders_map.html</a>
     </p>
     <p>
-      <a class="btn" href="/new">+ Add a New Work Order (Form)</a>
+      <a class="btn" href="/new">+ Add a New Work Order </a>
     </p>
     <p class="muted">
       Debug:
@@ -3492,6 +3650,26 @@ NEW_FORM_HTML = """
       transform: translateY(-1px); /* tiny optical centering */
       user-select:none;
     }
+    /* Shift time range inputs */
+    .timeRange {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .timeRange input[type="time"]{
+      width: 160px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid #ccc;
+      font-size: 13px;
+      background: #fff;
+    }
+    .timeRange .dash{
+      font-weight: 900;
+      color: #666;
+    }
+
 
   </style>
 
@@ -3766,17 +3944,37 @@ NEW_FORM_HTML = """
     return '<select name="' + name + '" class="wardSel" required><option value="">--</option></select>';
   }
 
-  function shiftSelectHtml(name){
-    var o = '<option value="">--</option>' + optList(shifts);
-    return '<select name="' + name + '" required>' + o + '</select>';
+  function shiftTimeHtml(nameCombined, nameStart, nameEnd){
+    return ''
+      + '<div class="timeRange">'
+      +   '<input type="time" class="tStart" name="' + nameStart + '" required>'
+      +   '<span class="dash">-</span>'
+      +   '<input type="time" class="tEnd" name="' + nameEnd + '" required>'
+      +   '<input type="hidden" class="shiftCombined" name="' + nameCombined + '">'
+      + '</div>';
   }
+
+  function fmt12FromTimeInput(v){
+    // v = "HH:MM" (24h)
+    if(!v) return '';
+    var parts = v.split(':');
+    if(parts.length < 2) return '';
+    var hh = parseInt(parts[0], 10);
+    var mm = parts[1];
+    if(isNaN(hh)) return '';
+    var ap = (hh >= 12) ? 'PM' : 'AM';
+    var h12 = hh % 12;
+    if(h12 === 0) h12 = 12;
+    return String(h12).padStart(2,'0') + ':' + mm + ap;
+  }
+
 
   function typeSelectHtml(name){
     var o = '<option value="">--</option>' + optList(types);
     return '<select name="' + name + '" required>' + o + '</select>';
   }
 
-  function addRow(){
+  function addRow(prefill){
     var idx = tbody.children.length;
     var tr = document.createElement('tr');
 
@@ -3786,7 +3984,7 @@ NEW_FORM_HTML = """
       + '<td>' + districtSelectHtml('District__NL_' + idx) + '</td>'
       + '<td>' + wardSelectHtml('Ward__NL_' + idx) + '</td>'
       + '<td><input name="Supervisor__NL_' + idx + '" list="supervisors_list" required placeholder="Supervisor"></td>'
-      + '<td>' + shiftSelectHtml('Shift__NL_' + idx) + '</td>'
+      + '<td>' + shiftTimeHtml('Shift__NL_' + idx, 'ShiftStart__NL_' + idx, 'ShiftEnd__NL_' + idx) + '</td>'
       + '<td>' + typeSelectHtml('Type__NL_' + idx) + '</td>'
       + '<td><input name="# of Equipment (Dump Trucks)_' + idx + '" type="number" min="0"></td>'
       + '<td><select name="Dump Truck Provider Contractor_' + idx + '">'
@@ -3819,6 +4017,62 @@ NEW_FORM_HTML = """
       + '<td><button type="button" class="ghost rmBtn">Remove</button></td>';
 
     tbody.appendChild(tr);
+    
+    if(prefill){
+        tr.querySelector('[name="WO_' + idx + '"]').value = prefill.WO || '';
+        tr.querySelector('[name="District__NL_' + idx + '"]').value = prefill.District || '';
+        tr.querySelector('[name="District__NL_' + idx + '"]').dispatchEvent(new Event('change'));
+        tr.querySelector('[name="Ward__NL_' + idx + '"]').value = prefill.Ward || '';
+        tr.querySelector('[name="Date__NL_' + idx + '"]').value = prefill.Date || '';
+        tr.querySelector('[name="Supervisor__NL_' + idx + '"]').value = prefill.Supervisor || '';
+
+        tr.querySelector('[name="Location_' + idx + '"]').value = prefill.Location || '';
+        tr.querySelector('[name="From_' + idx + '"]').value = prefill.From || '';
+        tr.querySelector('[name="To_' + idx + '"]').value = prefill.To || '';
+        tr.querySelector('[name="Type__NL_' + idx + '"]').value = prefill.Type || '';
+
+        tr.querySelector('[name="# of Equipment (Dump Trucks)_' + idx + '"]').value = prefill.DumpTrucks || '';
+        tr.querySelector('[name="Dump Truck Provider Contractor_' + idx + '"]').value = prefill.Provider || '';
+        tr.querySelector('[name="# of Loads_' + idx + '"]').value = prefill.Loads || '';
+        tr.querySelector('[name="Tonnes_' + idx + '"]').value = prefill.Tonnes || '';
+        tr.querySelector('[name="One Side/ Both Sides_' + idx + '"]').value = prefill.SideBoth || '';
+        tr.querySelector('[name="Side of Road Cleared_' + idx + '"]').value = prefill.RoadSide || '';
+        tr.querySelector('[name="Snow Dumped Site_' + idx + '"]').value = prefill.SnowSite || '';
+        tr.querySelector('[name="Comments_' + idx + '"]').value = prefill.Comments || '';
+
+        // Prefill shift if stored as "06:30AM - 06:30PM"
+        var sh = (prefill.Shift || '').replace('–','-').replace('—','-');
+        var parts = sh.split('-').map(function(x){ return x.trim(); }).filter(Boolean);
+
+        function to24(tok){
+            tok = String(tok||'').trim().toUpperCase().replace(/\\s+/g,'');
+            var m = tok.match(/^(\d{1,2}):(\d{2})(AM|PM)$/);
+            if(!m) return '';
+            var h = parseInt(m[1],10), mm = m[2], ap = m[3];
+            var hh24 = (h % 12) + (ap === 'PM' ? 12 : 0);
+            return String(hh24).padStart(2,'0') + ':' + mm;
+        }
+
+        if(parts.length >= 2){
+            var s24 = to24(parts[0]), e24 = to24(parts[1]);
+            if(s24) tr.querySelector('[name="ShiftStart__NL_' + idx + '"]').value = s24;
+            if(e24) tr.querySelector('[name="ShiftEnd__NL_' + idx + '"]').value = e24;
+        }
+    }
+
+
+    // --- Shift time inputs -> hidden combined value (Shift__NL_idx) ---
+    var tStart = tr.querySelector('.tStart');
+    var tEnd = tr.querySelector('.tEnd');
+    var tHidden = tr.querySelector('.shiftCombined');
+
+    function updateShiftHidden(){
+      var a = fmt12FromTimeInput(tStart.value);
+      var b = fmt12FromTimeInput(tEnd.value);
+      tHidden.value = (a && b) ? (a + ' - ' + b) : '';
+    }
+    tStart.addEventListener('change', updateShiftHidden);
+    tEnd.addEventListener('change', updateShiftHidden);
 
     // --- Location → To/From dependent lists (cross streets) ---
     var locIn = tr.querySelector('.locIn');
@@ -3895,7 +4149,14 @@ NEW_FORM_HTML = """
   addBtn.onclick = addRow;
 
   // start with 1 row
-  addRow();
+  // start with 1 row (or prefill rows if backend returned errors)
+  var PREFILL = {{ prefill_rows_json|default("[]")|safe }};
+  if (Array.isArray(PREFILL) && PREFILL.length) {
+    PREFILL.forEach(function(r){ addRow(r); });
+  } else {
+    addRow();
+  }
+
 })();
 </script>
 
@@ -4166,6 +4427,16 @@ EDIT_FORM_HTML = """
       color:#fff !important;
       border-color: rgba(0,0,0,0.10) !important;
     }
+    .timeRange { display:flex; align-items:center; gap:6px; white-space:nowrap; }
+    .timeRange input[type="time"]{
+      width: 170px;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid #ccc;
+      background:#fff;
+    }
+    .timeRange .dash{ font-weight:900; color:#666; }
+
   </style>
 
 
@@ -4179,7 +4450,7 @@ EDIT_FORM_HTML = """
       {% endif %}
       <div>
         <div style="font-weight:950;font-size:18px;letter-spacing:-0.02em;">Edit Intake Row</div>
-        <div class="help" style="margin-top:2px;">Internal operations tool</div>
+        <div class="help" style="margin-top:2px;">Internal Operations Tool</div>
       </div>
     </div>
     <div class="help">
@@ -4242,12 +4513,13 @@ EDIT_FORM_HTML = """
       <label>Supervisor</label>
       <input name="Supervisor__NL" list="supervisors_list" required value="{{ row.get('Supervisor\n','') }}"/>
       <label>Shift</label>
-      <select name="Shift__NL" required>
-        <option value="">-- choose --</option>
-        {% for sh in shifts %}
-        <option value="{{ sh }}" {% if row.get('Shift\\n','') == sh %}selected{% endif %}>{{ sh }}</option>
-        {% endfor %}
-      </select>
+      <div class="timeRange">
+        <input type="time" id="shiftStart" name="ShiftStart__NL" required>
+        <span class="dash">-</span>
+        <input type="time" id="shiftEnd" name="ShiftEnd__NL" required>
+        <input type="hidden" id="shiftCombined" name="Shift__NL" value="{{ row.get('Shift\\n','') }}"/>
+      </div>
+      <div class="help">Saved format: <code>06:30AM - 06:30PM</code></div>
 
       <label>Type</label>
       <select name="Type__NL" required>
@@ -4529,6 +4801,64 @@ EDIT_FORM_HTML = """
     })();
     </script>
   </div>
+<script>
+(function(){
+  function parseTokenTo24h(tok){
+    if(!tok) return null;
+    var s = String(tok).trim().toUpperCase().replace(/\\s+/g,'');
+    // HH:MM (24h)
+    var m = s.match(/^(\d{1,2}):(\d{2})$/);
+    if(m){
+      var hh = parseInt(m[1],10), mm = m[2];
+      if(hh>=0 && hh<=23) return String(hh).padStart(2,'0') + ':' + mm;
+      return null;
+    }
+    // H(:MM)?(AM|PM)
+    m = s.match(/^(\d{1,2})(?::(\d{2}))?(AM|PM)$/);
+    if(m){
+      var h12 = parseInt(m[1],10), mm2 = m[2] || '00', ap = m[3];
+      if(!(h12>=1 && h12<=12)) return null;
+      var hh24 = (h12 % 12) + (ap === 'PM' ? 12 : 0);
+      return String(hh24).padStart(2,'0') + ':' + mm2;
+    }
+    return null;
+  }
+
+  function fmt12(v){
+    if(!v) return '';
+    var p = v.split(':'); if(p.length<2) return '';
+    var hh = parseInt(p[0],10), mm = p[1];
+    var ap = (hh >= 12) ? 'PM' : 'AM';
+    var h12 = hh % 12; if(h12 === 0) h12 = 12;
+    return String(h12).padStart(2,'0') + ':' + mm + ap;
+  }
+
+  var start = document.getElementById('shiftStart');
+  var end = document.getElementById('shiftEnd');
+  var hidden = document.getElementById('shiftCombined');
+  if(!start || !end || !hidden) return;
+
+  function updateHidden(){
+    var a = fmt12(start.value);
+    var b = fmt12(end.value);
+    hidden.value = (a && b) ? (a + ' - ' + b) : '';
+  }
+
+  // Prefill from existing stored value like "06:30AM - 06:30PM"
+  var raw = (hidden.value || '').replace('–','-').replace('—','-');
+  var parts = raw.split('-').map(function(x){ return x.trim(); }).filter(Boolean);
+  if(parts.length >= 2){
+    var a24 = parseTokenTo24h(parts[0]);
+    var b24 = parseTokenTo24h(parts[1]);
+    if(a24) start.value = a24;
+    if(b24) end.value = b24;
+    updateHidden();
+  }
+
+  start.addEventListener('change', updateHidden);
+  end.addEventListener('change', updateHidden);
+})();
+</script>
 </body>
 </html>
 """
@@ -4644,7 +4974,11 @@ def new_submit():
         values["District\n"] = form.get(f"District__NL_{idx}", "")
         values["Ward\n"] = form.get(f"Ward__NL_{idx}", "")
         values["Date\n"] = form.get(f"Date__NL_{idx}", "")
-        values["Shift\n"] = form.get(f"Shift__NL_{idx}", "")
+        values["Shift\n"] = normalize_shift_time_range(
+            form.get(f"Shift__NL_{idx}", ""),
+            form.get(f"ShiftStart__NL_{idx}", ""),
+            form.get(f"ShiftEnd__NL_{idx}", ""),
+        )
         values["Supervisor\n"] = form.get(f"Supervisor__NL_{idx}", "")
         values["Location"] = form.get(f"Location_{idx}", "")
         values["From "] = form.get(f"From_{idx}", "")
@@ -4658,7 +4992,7 @@ def new_submit():
         values["Side of Road Cleared"] = form.get(f"Side of Road Cleared_{idx}", "")
         values["Snow Dumped Site"] = form.get(f"Snow Dumped Site_{idx}", "")
         values["Comments"] = form.get(f"Comments_{idx}", "")
-        values["Date\n"] = format_date_from_picker(values.get("Date\n", ""))
+
 
         # Skip fully empty accidental rows (but keep strict required)
         if normalize_blank(values.get("WO")) or normalize_blank(values.get("Location")):
@@ -4709,6 +5043,30 @@ def new_submit():
 
     if all_errors:
         log(f"INTAKE: batch rejected with {len(all_errors)} error(s)")
+        prefill_rows = []
+
+        for v in rows:
+            prefill_rows.append({
+                "WO": v.get("WO", ""),
+                "District": v.get("District\n", ""),
+                "Ward": v.get("Ward\n", ""),
+                "Date": v.get("Date\n", ""),
+                "Shift": v.get("Shift\n", ""),
+                "Supervisor": v.get("Supervisor\n", ""),
+                "Location": v.get("Location", ""),
+                "From": v.get("From ", ""),
+                "To": v.get("To", ""),
+                "Type": v.get("Type (Road Class/ School, Bridge)\n", ""),
+                "DumpTrucks": v.get("# of Equipment (Dump Trucks)", ""),
+                "Provider": v.get("Dump Truck Provider Contractor", ""),
+                "Loads": v.get("# of Loads", ""),
+                "Tonnes": v.get("Tonnes", ""),
+                "SideBoth": v.get("One Side/ Both Sides", ""),
+                "RoadSide": v.get("Side of Road Cleared", ""),
+                "SnowSite": v.get("Snow Dumped Site", ""),
+                "Comments": v.get("Comments", ""),
+            })
+
         return render_template_string(
             NEW_FORM_HTML,
             cot_logo_src=COT_LOGO_DATA_URI,
@@ -4727,6 +5085,7 @@ def new_submit():
             districts_json=json.dumps(latest_allowed_sets.get("District\n", [])),
             shifts_json=json.dumps(latest_allowed_sets.get("Shift\n", [])),
             types_json=json.dumps(latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", [])),
+            prefill_rows_json=json.dumps(prefill_rows),
             district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
         )
 
@@ -5134,7 +5493,7 @@ def recompute_allowed_sets_from_master():
     allowed["Ward\n"] = strict_list(STRICT_WARDS)
     allowed["Supervisor\n"] = strict_list(STRICT_SUPERVISORS)
     allowed["Shift\n"] = strict_list(STRICT_SHIFTS)
-    allowed["Type (Road Class/ School, Bridge)\n"] = strict_list(STRICT_TYPES)
+    allowed["Type (Road Class/ School, Bridge)\n"] = STRICT_TYPES[:] if STRICT_TYPES else learn("Type (Road Class/ School, Bridge)\n")
 
     try:
         df = pd.read_csv(MASTER_TRACKER_PATH, encoding="latin-1")
@@ -5229,7 +5588,7 @@ def watcher_loop():
         latest_centre_streets = stats.get("centre_streets", [])
         latest_street_to_cross = stats.get("street_to_cross", {})
         latest_build_stats = {
-            "status": "ready",
+            "status": "Ready",
             "last_build": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             **{k: v for k, v in stats.items() if k != "centre_streets"},
         }
@@ -5247,12 +5606,13 @@ def watcher_loop():
         cur_fp = file_fingerprint(MASTER_TRACKER_PATH)
         if cur_fp != last_fp:
             with LAST_MASTER_WRITE_LOCK:
-                recent_intake_write = (time.time() - LAST_MASTER_WRITE_BY_INTAKE_AT) < 4.0
+                fp_intake = LAST_MASTER_FP_WRITTEN_BY_INTAKE
 
-            if recent_intake_write:
-                log("Watcher: master changed but was just written by intake. Skipping watcher rebuild.")
+            if fp_intake is not None and cur_fp == fp_intake:
+                log("Watcher: master changed but was written by intake. Skipping watcher rebuild.")
                 last_fp = cur_fp
                 continue
+
 
             notify_user(
                 "Detected change in input data",
