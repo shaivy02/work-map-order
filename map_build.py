@@ -3483,6 +3483,16 @@ NEW_FORM_HTML = """
       color:#fff !important;
       border-color: rgba(220,38,38,0.30) !important;
     }
+    
+    /* Mac-style close glyph alignment */
+    #dismissSubmitted .closeGlyph{
+      display:block;
+      line-height:1;
+      font-size:18px;
+      transform: translateY(-1px); /* tiny optical centering */
+      user-select:none;
+    }
+
   </style>
 
 </head>
@@ -3536,8 +3546,8 @@ NEW_FORM_HTML = """
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;">
         <button type="button" id="dismissSubmitted" title="Dismiss"
-                style="width:32px;height:32px;border-radius:999px;border:1px solid rgba(220,38,38,0.30);background:#dc2626;color:#fff;cursor:pointer;font-weight:900;">
-          ✕
+                style="width:32px;height:32px;border-radius:999px;border:1px solid rgba(220,38,38,0.30);background:#dc2626;color:#fff;cursor:pointer;font-weight:900;padding:0;display:inline-flex;align-items:center;justify-content:center;">
+          <span class="closeGlyph">×</span>
         </button>
         <a href="/outputs/work_orders_map.html" target="_blank" rel="noopener noreferrer"
            style="display:inline-block;padding:10px 12px;border-radius:12px;background:#111;color:#fff;text-decoration:none;font-weight:900;">
@@ -4150,6 +4160,12 @@ EDIT_FORM_HTML = """
       font-size: 12px;
       color: #111827;
     }
+    /* Edit timer button styling safety */
+    #editExtendBtn{
+      background:#6b7280 !important;
+      color:#fff !important;
+      border-color: rgba(0,0,0,0.10) !important;
+    }
   </style>
 
 
@@ -4175,15 +4191,17 @@ EDIT_FORM_HTML = """
       Submission ID: <code>{{ row.get('__submission_id','') }}</code> • Status: <code>{{ row.get('__status','') }}</code>
     </div>
     <div id="editTimerBox"
-         style="margin-top:10px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--stroke);border-radius:14px;background:#f9fafb;">
-      <div style="font-weight:900;font-size:13px;">
-        Editing window: <span id="editPendingTimer" style="font-size:16px;font-variant-numeric:tabular-nums;">--:--</span>
+         style="margin-top:10px;display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--stroke);border-radius:14px;background:#f9fafb;">
+      <div style="font-weight:900;font-size:13px;display:flex;align-items:center;gap:10px;">
+        <span>Editing window:</span>
+        <span id="editPendingTimer" style="font-size:16px;font-variant-numeric:tabular-nums;min-width:56px;display:inline-block;text-align:right;">--:--</span>
+
+        <button type="button" id="editExtendBtn"
+                style="display:none;padding:6px 10px;border-radius:999px;border:1px solid rgba(0,0,0,0.10);background:#6b7280;color:#fff;font-weight:900;font-size:12px;cursor:pointer;line-height:1;">
+          Extend
+        </button>
       </div>
-      <button type="button" id="editExtendBtn"
-              style="display:none;padding:6px 10px;border-radius:999px;border:1px solid rgba(0,0,0,0.12);background:#fff;font-weight:900;font-size:12px;cursor:pointer;">
-        Extend
-      </button>
-    </div>    
+    </div>
   </div>
 
   {% if ok %}
