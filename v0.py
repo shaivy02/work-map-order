@@ -4037,7 +4037,7 @@ EDIT_FORM_HTML = """
       <input name="Date__NL" required value="{{ row.get('Date\\n','') }}"/>
 
       <label>District</label>
-      <select name="District__NL" required>
+      <select name="District__NL" id="districtSel" class="districtSel" required>
         <option value="">-- choose --</option>
         {% for d in districts %}
         <option value="{{ d }}" {% if row.get('District\\n','') == d %}selected{% endif %}>{{ d }}</option>
@@ -4045,7 +4045,7 @@ EDIT_FORM_HTML = """
       </select>
 
       <label>Ward</label>
-      <select name="Ward__NL" required>
+      <select name="Ward__NL" id="wardSel" class="wardSel" required>
         <option value="">-- choose --</option>
         {% for w in wards %}
         <option value="{{ w }}" {% if row.get('Ward\\n','') == w %}selected{% endif %}>{{ w }}</option>
@@ -4053,8 +4053,7 @@ EDIT_FORM_HTML = """
       </select>
 
       <label>Supervisor</label>
-      <input name="Supervisor__NL" required value="{{ row.get('Supervisor\\n','') }}"/>
-
+      <input name="Supervisor__NL" list="supervisors_list" required value="{{ row.get('Supervisor\n','') }}"/>
       <label>Shift</label>
       <select name="Shift__NL" required>
         <option value="">-- choose --</option>
@@ -4116,13 +4115,13 @@ EDIT_FORM_HTML = """
       <textarea name="Comments" rows="3">{{ row.get('Comments','') }}</textarea>
 
       <label>Location</label>
-      <input name="Location" required value="{{ row.get('Location','') }}"/>
+      <input class="locIn" id="locIn" name="Location" list="streets" required value="{{ row.get('Location','') }}"/>
 
       <label>From</label>
-      <input name="From" value="{{ row.get('From ','') }}"/>
+      <input class="fromIn" id="fromIn" name="From" value="{{ row.get('From ','') }}"/>
 
       <label>To</label>
-      <input name="To" value="{{ row.get('To','') }}"/>
+      <input class="toIn" id="toIn" name="To" value="{{ row.get('To','') }}"/>
 
       <button type="submit">Save changes</button>
       <button type="submit" name="delete" value="1" class="ghost" style="margin-left:8px;">Delete (Pending only)</button>
@@ -4131,6 +4130,122 @@ EDIT_FORM_HTML = """
         Editing only works while status is <b>PENDING</b>. After it becomes <b>APPLIED</b>, it’s locked to protect the master DB.
       </div>
     </form>
+
+    <datalist id="streets">
+      {% for st in streets %}
+      <option value="{{ st }}"></option>
+      {% endfor %}
+    </datalist>
+
+    <datalist id="supervisors_list">
+      {% for s in supervisors %}
+      <option value="{{ s }}"></option>
+      {% endfor %}
+    </datalist>
+
+    <div id="crossLists" style="display:none;"></div>
+
+    <script>
+    (function(){
+      // ---- District -> Ward dependency ----
+      var districtToWards = {{ district_to_wards_json | safe }};
+
+      var districtSel = document.getElementById('districtSel');
+      var wardSel = document.getElementById('wardSel');
+
+      function setWards(){
+        if(!districtSel || !wardSel) return;
+        var d = (districtSel.value || '').toString().trim().toUpperCase();
+        var wards = districtToWards[d] || [];
+        var prev = wardSel.value;
+
+        wardSel.innerHTML = '<option value="">-- choose --</option>';
+        wards.forEach(function(w){
+          var opt = document.createElement('option');
+          opt.value = w;
+          opt.textContent = w;
+          wardSel.appendChild(opt);
+        });
+
+        if (prev && wards.indexOf(prev) !== -1) wardSel.value = prev;
+        else if (wards.length) wardSel.value = wards[0];
+      }
+
+      if (districtSel && wardSel){
+        setWards(); // run once on load (keeps current ward if valid)
+        districtSel.addEventListener('change', setWards);
+      }
+
+      // ---- Location -> To/From dependent lists (same as NEW_FORM_HTML) ----
+      var crossListsHost = document.getElementById('crossLists');
+      var locIn = document.getElementById('locIn');
+      var toIn = document.getElementById('toIn');
+      var fromIn = document.getElementById('fromIn');
+
+      if (!crossListsHost || !locIn || !toIn || !fromIn) return;
+
+      function populateDatalist(dl, arr, excludeVal){
+        if (!dl) return;
+        var ex = (excludeVal || '').toString().trim().toUpperCase();
+        dl.innerHTML = '';
+        (arr || []).forEach(function(s){
+          var v = (s || '').toString();
+          if (!v) return;
+          if (ex && v.toUpperCase() === ex) return;
+          var opt = document.createElement('option');
+          opt.value = v;
+          dl.appendChild(opt);
+        });
+      }
+
+      async function fetchCrossStreets(locationVal){
+        var loc = (locationVal || '').toString().trim();
+        if (!loc) return { matched_location: "", cross_streets: [] };
+        try{
+          var resp = await fetch('/api/cross_streets?location=' + encodeURIComponent(loc));
+          if(!resp.ok) throw new Error('bad resp');
+          return await resp.json();
+        }catch(e){
+          return { matched_location: "", cross_streets: [] };
+        }
+      }
+
+      var dlTo = document.createElement('datalist');
+      dlTo.id = 'cross_to_edit';
+      dlTo.setAttribute('data-crosslist','1');
+      crossListsHost.appendChild(dlTo);
+      toIn.setAttribute('list', dlTo.id);
+
+      var dlFrom = document.createElement('datalist');
+      dlFrom.id = 'cross_from_edit';
+      dlFrom.setAttribute('data-crosslist','1');
+      crossListsHost.appendChild(dlFrom);
+      fromIn.setAttribute('list', dlFrom.id);
+
+      var cachedCross = [];
+
+      async function refreshCrossLists(){
+        var data = await fetchCrossStreets(locIn.value);
+        cachedCross = (data && data.cross_streets) ? data.cross_streets : [];
+        populateDatalist(dlTo, cachedCross, fromIn.value);
+        populateDatalist(dlFrom, cachedCross, toIn.value);
+      }
+
+      locIn.addEventListener('change', refreshCrossLists);
+      locIn.addEventListener('blur', refreshCrossLists);
+
+      toIn.addEventListener('change', function(){
+        populateDatalist(dlFrom, cachedCross, toIn.value);
+      });
+      fromIn.addEventListener('change', function(){
+        populateDatalist(dlTo, cachedCross, fromIn.value);
+      });
+
+      // initial populate for the existing record
+      refreshCrossLists();
+    })();
+    </script>
+
   </div>
 </body>
 </html>
@@ -4397,6 +4512,8 @@ def edit_form(sid):
         districts=latest_allowed_sets.get("District\n", []),
         wards=wards_for_district(row.get("District\n", "")) or latest_allowed_sets.get("Ward\n", []),
         supervisors=latest_allowed_sets.get("Supervisor\n", []),
+        streets=latest_centre_streets,
+        district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
         shifts=latest_allowed_sets.get("Shift\n", []),
         types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
         dump_truck_providers=DUMP_TRUCK_PROVIDERS,
@@ -4426,6 +4543,8 @@ def edit_submit(sid):
             districts=latest_allowed_sets.get("District\n", []),
             wards=wards_for_district((row2 or row).get("District\n", "")) or latest_allowed_sets.get("Ward\n", []),
             supervisors=latest_allowed_sets.get("Supervisor\n", []),
+            streets=latest_centre_streets,
+            district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
             shifts=latest_allowed_sets.get("Shift\n", []),
             types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
             dump_truck_providers=DUMP_TRUCK_PROVIDERS,
@@ -4470,6 +4589,8 @@ def edit_submit(sid):
             districts=latest_allowed_sets.get("District\n", []),
             wards=allowed_sets.get("Ward\n", []),
             supervisors=latest_allowed_sets.get("Supervisor\n", []),
+            streets=latest_centre_streets,
+            district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
             shifts=latest_allowed_sets.get("Shift\n", []),
             types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
             dump_truck_providers=DUMP_TRUCK_PROVIDERS,
@@ -4487,6 +4608,8 @@ def edit_submit(sid):
         districts=latest_allowed_sets.get("District\n", []),
         wards=wards_for_district((row2 or row).get("District\n", "")) or latest_allowed_sets.get("Ward\n", []),
         supervisors=latest_allowed_sets.get("Supervisor\n", []),
+        streets=latest_centre_streets,
+        district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
         shifts=latest_allowed_sets.get("Shift\n", []),
         types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
     )

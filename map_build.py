@@ -158,7 +158,7 @@ def wards_for_district(district_val: str):
 
 INTAKE_PATH = os.path.join(BASE_DIR, "intake_submissions.csv")
 INTAKE_POLL_SECONDS = 10
-INTAKE_EXTRA_COLS = ["__submitted_at", "__edited_at", "__submission_id", "__batch_id", "__status"]
+INTAKE_EXTRA_COLS = ["__submitted_at", "__edited_at", "__submission_id", "__batch_id", "__status", "__pending_until_epoch"]
 PENDING_GRACE_SECONDS = 60  # keep rows editable for 60s before they can be applied
 
 
@@ -591,7 +591,7 @@ def append_batch_to_intake(list_of_values: list):
             out["__submission_id"] = submission_id
             out["__batch_id"] = batch_id
             out["__status"] = "PENDING"
-
+            out["__pending_until_epoch"] = str(int(time.time() + float(PENDING_GRACE_SECONDS)))
             df = pd.concat([df, pd.DataFrame([out])], ignore_index=True)
             existing_ids.add(submission_id)
             inserted_count += 1
@@ -804,15 +804,19 @@ def apply_intake_to_master():
 
         pending = intake[intake["__status"].astype(str).str.upper().eq("PENDING")].copy()
 
-        # Parse __submitted_at safely
+        # Use __pending_until_epoch if available; fallback to __submitted_at + grace
+        now_epoch = time.time()
+
+        pending_until = pd.to_numeric(pending.get("__pending_until_epoch", ""), errors="coerce")
+
         ts = pd.to_datetime(pending.get("__submitted_at", ""), errors="coerce")
-        # If missing/invalid timestamp, treat as "old" so it won't get stuck forever
         ts = ts.fillna(pd.Timestamp("1970-01-01"))
+        submitted_epoch = ts.astype("int64") / 1e9
 
-        now_ts = pd.Timestamp.now()
-        age_seconds = (now_ts - ts).dt.total_seconds()
+        fallback_until = submitted_epoch + float(PENDING_GRACE_SECONDS)
+        pending_until = pending_until.fillna(fallback_until)
 
-        eligible = pending[age_seconds >= float(PENDING_GRACE_SECONDS)].copy()
+        eligible = pending[pending_until <= float(now_epoch)].copy()
 
         new_rows = eligible[~eligible["__submission_id"].astype(str).isin(master_ids)].copy()
 
@@ -3448,27 +3452,71 @@ NEW_FORM_HTML = """
       #woTable tbody td:nth-child(17),
       #woTable tbody td:nth-child(18){ grid-column: 1 / -1; }
     }
+    .statusPill{
+      display:inline-flex;
+      align-items:center;
+      padding:6px 10px;
+      border-radius:999px;
+      font-weight:900;
+      font-size:12px;
+      border:1px solid rgba(0,0,0,0.10);
+      background:#fff;
+    }
+    .statusPending{
+      background: rgba(245, 158, 11, 0.14);
+      border-color: rgba(245, 158, 11, 0.35);
+      color:#92400e;
+    }
+    .statusApplied{
+      background: rgba(16, 185, 129, 0.14);
+      border-color: rgba(16, 185, 129, 0.35);
+      color:#065f46;
+    }
+    /* Force button colors (overrides inline styles if needed) */
+    #extendBtn{
+      background:#6b7280 !important;
+      color:#fff !important;
+      border-color: rgba(0,0,0,0.10) !important;
+    }
+    #dismissSubmitted{
+      background:#dc2626 !important;
+      color:#fff !important;
+      border-color: rgba(220,38,38,0.30) !important;
+    }
   </style>
 
 </head>
 <body>
   <div class="card">
-    <h2 style="margin:0 0 6px 0;">Add Work Orders (Batch)</h2>
-    <p class="help" style="margin:0;">
-      <a href="/">← Back</a> |
-      <a href="/outputs/work_orders_map.html" target="_blank" rel="noopener noreferrer">Open Map</a>
-    </p>
-    <div class="help" style="margin-top:8px;">
-      Tip: Add multiple rows and submit once. You can edit any <b>PENDING</b> row instantly before it gets applied.
+    <div style="display:flex;align-items:center;gap:12px;">
+      {% if cot_logo_src %}
+      <img src="{{ cot_logo_src }}" alt="City of Toronto"
+           style="height:38px;width:auto;object-fit:contain;display:block;" />
+      {% endif %}
+      <div style="flex:1;">
+        <h2 style="margin:0 0 6px 0;">Add Work Orders (Batch)</h2>
+        <p class="help" style="margin:0;">
+          <a href="/">← Back</a> |
+          <a href="/outputs/work_orders_map.html" target="_blank" rel="noopener noreferrer">Open Map</a>
+        </p>
+        <div class="help" style="margin-top:8px;">
+          Tip: Add multiple rows and submit once. You can edit any <b>PENDING</b> row instantly before it gets applied.
+        </div>
+      </div>
     </div>
   </div>
 
   {% if batch and batch_id %}
-  <div class="card ok">
+  <div class="card ok" id="submittedPanel">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
         <div id="pendingTimerBox" style="margin-top:12px;padding:12px;border-radius:12px;border:1px solid rgba(0,0,0,0.10);background:rgba(255,255,255,0.85);">
       <div style="font-weight:900;font-size:14px;">
-        Editing window: <span id="pendingTimer" style="font-size:18px;">--:--</span>
+        Editing window:
+        <span id="pendingTimer" style="font-size:18px;">--:--</span>
+        <button type="button" id="extendBtn"
+                style="margin-left:10px;display:none;padding:6px 10px;border-radius:999px;border:1px solid rgba(0,0,0,0.10);background:#6b7280;color:#fff;font-weight:900;font-size:12px;cursor:pointer;">
+          Extend
+        </button>
       </div>
       <div class="help" style="margin-top:6px;">
         You can edit any <b>PENDING</b> row until the timer ends. In the last 10 seconds, the timer will flash.
@@ -3486,9 +3534,13 @@ NEW_FORM_HTML = """
           Inserted: <code>{{ inserted_count }}</code>
         </div>
       </div>
-      <div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;">
+        <button type="button" id="dismissSubmitted" title="Dismiss"
+                style="width:32px;height:32px;border-radius:999px;border:1px solid rgba(220,38,38,0.30);background:#dc2626;color:#fff;cursor:pointer;font-weight:900;">
+          ✕
+        </button>
         <a href="/outputs/work_orders_map.html" target="_blank" rel="noopener noreferrer"
-           style="display:inline-block;padding:10px 12px;border-radius:10px;background:#111;color:#fff;text-decoration:none;font-weight:900;">
+           style="display:inline-block;padding:10px 12px;border-radius:12px;background:#111;color:#fff;text-decoration:none;font-weight:900;">
           Open Map
         </a>
       </div>
@@ -3544,11 +3596,16 @@ NEW_FORM_HTML = """
           <td>{{ r.get('Location','') }}</td>
           <td>{{ r.get('From ','') }}</td>
           <td>{{ r.get('To','') }}</td>
-          <td><code>{{ r.get('__status','') }}</code></td>
-
+          <td>
+            {% set st = (r.get('__status','')|string)|upper %}
+            <span class="statusPill {{ 'statusApplied' if st=='APPLIED' else 'statusPending' }}"
+                  data-sid="{{ r.get('__submission_id','') }}">
+              {{ st if st else '—' }}
+            </span>
+          </td>
           <td>
             {% if (r.get('__status','')|upper) == 'PENDING' %}
-              <a href="/edit/{{ r.get('__submission_id','') }}">Edit</a>
+              <a href="/edit/{{ r.get('__submission_id','') }}?bid={{ batch_id }}">Edit</a>
             {% else %}
               <span style="color:#777;">Locked</span>
             {% endif %}
@@ -3835,41 +3892,134 @@ NEW_FORM_HTML = """
 <script>
 (function(){
   // Only runs on the "Submitted ✅" view when batch exists
-  var seconds = {{ apply_in_seconds | default(0) }};
-  var box = document.getElementById('pendingTimerBox');
-  var el = document.getElementById('pendingTimer');
-  if (!box || !el) return;
+  var bid = "{{ batch_id }}";
+  if (!bid) return;
 
-  function fmt(s){
-    s = Math.max(0, parseInt(s || 0, 10));
-    var m = Math.floor(s / 60);
-    var r = s % 60;
-    return String(m).padStart(2,'0') + ':' + String(r).padStart(2,'0');
+  var timerEl = document.getElementById('pendingTimer');
+  var extendBtn = document.getElementById('extendBtn');
+  var dismissBtn = document.getElementById('dismissSubmitted');
+  var panel = document.getElementById('submittedPanel');
+
+  function fmt(sec){
+    sec = Math.max(0, Math.floor(sec || 0));
+    var m = Math.floor(sec / 60);
+    var s = sec % 60;
+    return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+  }
+
+  var serverNow = 0;
+  var pendingUntil = 0;
+  var remaining = 0;
+  var lastPollAt = 0;
+
+  function applyTimerClasses(rem){
+    if (!timerEl) return;
+    timerEl.classList.remove('timerWarn','timerFinal');
+    if (rem <= 10 && rem > 0) timerEl.classList.add('timerFinal');
+    else if (rem <= 20 && rem > 0) timerEl.classList.add('timerWarn');
+  }
+
+  function updateExtendButton(rem){
+    if (!extendBtn) return;
+    if (rem <= 20 && rem > 0){
+      extendBtn.style.display = 'inline-block';
+      extendBtn.disabled = false;
+      extendBtn.style.opacity = '1';
+      extendBtn.style.cursor = 'pointer';
+    } else {
+      extendBtn.style.display = 'none';
+      extendBtn.disabled = true;
+    }
+  }
+
+  function updateStatusPills(statuses){
+    try{
+      var pills = document.querySelectorAll('.statusPill[data-sid]');
+      pills.forEach(function(p){
+        var sid = p.getAttribute('data-sid') || '';
+        var st = (statuses && statuses[sid]) ? String(statuses[sid]).toUpperCase() : String(p.textContent||'').toUpperCase();
+        if (!st) return;
+        p.textContent = st;
+        p.classList.remove('statusPending','statusApplied');
+        if (st === 'APPLIED') p.classList.add('statusApplied');
+        else if (st === 'PENDING') p.classList.add('statusPending');
+      });
+    }catch(e){}
+  }
+
+  async function poll(){
+    var now = Date.now();
+    if (now - lastPollAt < 1500) return; // throttle a bit
+    lastPollAt = now;
+
+    try{
+      var resp = await fetch('/api/pending_status?bid=' + encodeURIComponent(bid) + '&_t=' + now);
+      if(!resp.ok) return;
+      var j = await resp.json();
+      if (!j || !j.ok) return;
+
+      serverNow = Number(j.server_now_epoch || 0);
+      pendingUntil = Number(j.pending_until_epoch || 0);
+
+      // compute remaining using server values
+      remaining = Math.max(0, pendingUntil - serverNow);
+
+      if (timerEl){
+        timerEl.textContent = fmt(remaining);
+        applyTimerClasses(remaining);
+      }
+      updateExtendButton(remaining);
+      updateStatusPills(j.statuses || {});
+    }catch(e){}
   }
 
   function tick(){
-    el.textContent = fmt(seconds);
-
-    // agitation rules
-    box.classList.remove('timerWarn','timerFinal');
-    if (seconds <= 10 && seconds > 0){
-      box.classList.add('timerFinal');
-    } else if (seconds <= 20 && seconds > 0){
-      box.classList.add('timerWarn');
+    // decrement locally between polls for smoothness
+    if (remaining > 0){
+      remaining -= 1;
+      if (timerEl){
+        timerEl.textContent = fmt(remaining);
+        applyTimerClasses(remaining);
+      }
+      updateExtendButton(remaining);
     }
 
-    if (seconds <= 0){
-      el.textContent = "00:00";
-      // Optional: show "submitted" state
-      box.classList.remove('timerWarn','timerFinal');
-      box.style.background = 'rgba(240,240,240,0.95)';
-      return;
+    // refresh from server every ~4 seconds to avoid drift and update statuses
+    if ((Date.now() - lastPollAt) > 4000){
+      poll();
     }
 
-    seconds -= 1;
     setTimeout(tick, 1000);
   }
 
+  if (extendBtn){
+    extendBtn.addEventListener('click', async function(){
+      try{
+        extendBtn.disabled = true;
+        var resp = await fetch('/api/extend_pending', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({bid: bid})
+        });
+        // even if it fails, just re-poll to reflect truth
+        await poll();
+      }catch(e){
+        await poll();
+      }
+    });
+  }
+
+  if (dismissBtn && panel){
+    dismissBtn.addEventListener('click', function(){
+      panel.style.display = 'none';
+      // focus first WO input for next entry
+      var firstWo = document.querySelector('input[name="WO_0"]');
+      if (firstWo) firstWo.focus();
+    });
+  }
+
+  // initial sync + start ticking
+  poll();
   tick();
 })();
 </script>
@@ -4006,7 +4156,16 @@ EDIT_FORM_HTML = """
 </head>
 <body>
   <div class="card">
-    <h2 style="margin:0 0 6px 0;">Edit Intake Row</h2>
+    <div style="display:flex;align-items:center;gap:12px;">
+      {% if cot_logo_src %}
+      <img src="{{ cot_logo_src }}" alt="City of Toronto"
+           style="height:38px;width:auto;object-fit:contain;display:block;" />
+      {% endif %}
+      <div>
+        <div style="font-weight:950;font-size:18px;letter-spacing:-0.02em;">Edit Intake Row</div>
+        <div class="help" style="margin-top:2px;">Internal operations tool</div>
+      </div>
+    </div>
     <div class="help">
       <a href="/new?bid={{ row.get('__batch_id','') }}">← Back to Batch</a> |
       <a href="/">Home</a> |
@@ -4015,6 +4174,16 @@ EDIT_FORM_HTML = """
     <div class="help" style="margin-top:8px;">
       Submission ID: <code>{{ row.get('__submission_id','') }}</code> • Status: <code>{{ row.get('__status','') }}</code>
     </div>
+    <div id="editTimerBox"
+         style="margin-top:10px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--stroke);border-radius:14px;background:#f9fafb;">
+      <div style="font-weight:900;font-size:13px;">
+        Editing window: <span id="editPendingTimer" style="font-size:16px;font-variant-numeric:tabular-nums;">--:--</span>
+      </div>
+      <button type="button" id="editExtendBtn"
+              style="display:none;padding:6px 10px;border-radius:999px;border:1px solid rgba(0,0,0,0.12);background:#fff;font-weight:900;font-size:12px;cursor:pointer;">
+        Extend
+      </button>
+    </div>    
   </div>
 
   {% if ok %}
@@ -4245,7 +4414,102 @@ EDIT_FORM_HTML = """
       refreshCrossLists();
     })();
     </script>
+    
+    <script>
+    (function(){
+      var bid = "{{ row.get('__batch_id','') }}";
+      if (!bid) return;
 
+      var timerEl = document.getElementById('editPendingTimer');
+      var extendBtn = document.getElementById('editExtendBtn');
+
+      function fmt(sec){
+        sec = Math.max(0, Math.floor(sec || 0));
+        var m = Math.floor(sec / 60);
+        var s = sec % 60;
+        return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+      }
+
+      var remaining = 0;
+      var lastPollAt = 0;
+
+      function applyTimerClasses(rem){
+        if (!timerEl) return;
+        timerEl.classList.remove('timerWarn','timerFinal');
+        if (rem <= 10 && rem > 0) timerEl.classList.add('timerFinal');
+        else if (rem <= 20 && rem > 0) timerEl.classList.add('timerWarn');
+      }
+
+      function updateExtendButton(rem){
+        if (!extendBtn) return;
+        if (rem <= 20 && rem > 0){
+          extendBtn.style.display = 'inline-block';
+          extendBtn.disabled = false;
+        } else {
+          extendBtn.style.display = 'none';
+          extendBtn.disabled = true;
+        }
+      }
+
+      async function poll(){
+        var now = Date.now();
+        if (now - lastPollAt < 1500) return;
+        lastPollAt = now;
+
+        try{
+          var resp = await fetch('/api/pending_status?bid=' + encodeURIComponent(bid) + '&_t=' + now);
+          if(!resp.ok) return;
+          var j = await resp.json();
+          if (!j || !j.ok) return;
+
+          var serverNow = Number(j.server_now_epoch || 0);
+          var pendingUntil = Number(j.pending_until_epoch || 0);
+
+          remaining = Math.max(0, pendingUntil - serverNow);
+
+          if (timerEl){
+            timerEl.textContent = fmt(remaining);
+            applyTimerClasses(remaining);
+          }
+          updateExtendButton(remaining);
+        }catch(e){}
+      }
+
+      function tick(){
+        if (remaining > 0){
+          remaining -= 1;
+          if (timerEl){
+            timerEl.textContent = fmt(remaining);
+            applyTimerClasses(remaining);
+          }
+          updateExtendButton(remaining);
+        }
+        if ((Date.now() - lastPollAt) > 4000){
+          poll();
+        }
+        setTimeout(tick, 1000);
+      }
+
+      if (extendBtn){
+        extendBtn.addEventListener('click', async function(){
+          try{
+            extendBtn.disabled = true;
+            await fetch('/api/extend_pending', {
+              method: 'POST',
+              headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({bid: bid})
+            });
+            await poll();
+          }catch(e){
+            await poll();
+          }
+        });
+      }
+
+      poll();
+      tick();
+    })();
+    </script>
   </div>
 </body>
 </html>
@@ -4278,27 +4542,42 @@ def new_form():
     apply_in_seconds = 0
 
     if batch:
-        # Use the earliest submitted_at across the batch so the whole batch shares one timer
-        ts_list = []
-        for r in batch:
-            s = (r.get("__submitted_at", "") or "").strip()
-            if s:
-                try:
-                    ts_list.append(datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp())
-                except Exception:
-                    pass
+        server_now_epoch = time.time()
 
-        if ts_list:
-            earliest = min(ts_list)
-            apply_at = earliest + float(PENDING_GRACE_SECONDS)
-            apply_in_seconds = max(0, int(round(apply_at - server_now_epoch)))
+        pending_untils = []
+        for r in batch:
+            st = str(r.get("__status", "")).strip().upper()
+            if st != "PENDING":
+                continue
+
+            pu_raw = str(r.get("__pending_until_epoch", "")).strip()
+            try:
+                pu = float(pu_raw) if pu_raw else None
+            except Exception:
+                pu = None
+
+            if pu is None:
+                # fallback: __submitted_at + grace
+                try:
+                    ts = pd.to_datetime(r.get("__submitted_at", ""), errors="coerce")
+                    if pd.isna(ts):
+                        pu = 0.0
+                    else:
+                        pu = float(ts.timestamp()) + float(PENDING_GRACE_SECONDS)
+                except Exception:
+                    pu = 0.0
+
+            pending_untils.append(float(pu))
+
+        if pending_untils:
+            apply_in_seconds = int(max(0, min(pending_untils) - float(server_now_epoch)))
         else:
-            # If timestamps missing, assume it's ready to apply
             apply_in_seconds = 0
 
 
     return render_template_string(
         NEW_FORM_HTML,
+        cot_logo_src=COT_LOGO_DATA_URI,
         errors=[],
         batch=batch,
         batch_id=bid,
@@ -4372,6 +4651,7 @@ def new_submit():
     if not rows:
         return render_template_string(
             NEW_FORM_HTML,
+            cot_logo_src=COT_LOGO_DATA_URI,
             errors=["No rows found. Click + Add Row and fill at least one Work Order."],
             batch=[],
             batch_id="",
@@ -4413,6 +4693,7 @@ def new_submit():
         log(f"INTAKE: batch rejected with {len(all_errors)} error(s)")
         return render_template_string(
             NEW_FORM_HTML,
+            cot_logo_src=COT_LOGO_DATA_URI,
             errors=all_errors,
             batch=[],
             batch_id="",
@@ -4491,6 +4772,145 @@ def api_cross_streets():
         mimetype="application/json",
     )
 
+@app.get("/api/pending_status")
+def api_pending_status():
+    auth_resp = require_auth_or_401()
+    if auth_resp:
+        return auth_resp
+
+    bid = (request.args.get("bid") or "").strip()
+    if not bid:
+        return Response(json.dumps({"ok": False, "error": "missing bid"}), mimetype="application/json", status=400)
+
+    ensure_intake_file()
+
+    with FILE_LOCK:
+        try:
+            df = pd.read_csv(INTAKE_PATH, encoding="utf-8")
+        except Exception:
+            df = pd.read_csv(INTAKE_PATH, encoding="latin-1")
+
+    if "__batch_id" not in df.columns:
+        return Response(json.dumps({"ok": False, "error": "intake missing __batch_id"}), mimetype="application/json", status=500)
+
+    sub = df[df["__batch_id"].astype(str) == bid].copy()
+    if sub.empty:
+        return Response(json.dumps({"ok": True, "bid": bid, "server_now_epoch": time.time(), "pending_until_epoch": 0, "pending_count": 0, "statuses": {}}),
+                       mimetype="application/json")
+
+    # statuses map: sid -> status
+    statuses = {}
+    for _, r in sub.iterrows():
+        sid = str(r.get("__submission_id", "")).strip()
+        st = str(r.get("__status", "")).strip()
+        if sid:
+            statuses[sid] = st
+
+    pending = sub[sub["__status"].astype(str).str.upper().eq("PENDING")].copy()
+
+    now_epoch = time.time()
+    pending_until_epoch = 0
+    pending_count = int(len(pending))
+
+    if not pending.empty:
+        pu = pd.to_numeric(pending.get("__pending_until_epoch", ""), errors="coerce")
+
+        ts = pd.to_datetime(pending.get("__submitted_at", ""), errors="coerce")
+        ts = ts.fillna(pd.Timestamp("1970-01-01"))
+        submitted_epoch = ts.astype("int64") / 1e9
+
+        fallback_until = submitted_epoch + float(PENDING_GRACE_SECONDS)
+        pu = pu.fillna(fallback_until)
+
+        try:
+            pending_until_epoch = float(pu.min())
+        except Exception:
+            pending_until_epoch = 0
+
+    return Response(
+        json.dumps(
+            {
+                "ok": True,
+                "bid": bid,
+                "server_now_epoch": float(now_epoch),
+                "pending_until_epoch": float(pending_until_epoch),
+                "pending_count": pending_count,
+                "statuses": statuses,
+            },
+            ensure_ascii=False,
+        ),
+        mimetype="application/json",
+    )
+
+
+@app.post("/api/extend_pending")
+def api_extend_pending():
+    auth_resp = require_auth_or_401()
+    if auth_resp:
+        return auth_resp
+
+    payload = request.get_json(silent=True) or {}
+    bid = (payload.get("bid") or request.form.get("bid") or "").strip()
+    if not bid:
+        return Response(json.dumps({"ok": False, "error": "missing bid"}), mimetype="application/json", status=400)
+
+    # Check if it's within the last 20 seconds before allowing extend
+    # (server-enforced to match UI behavior)
+    ensure_intake_file()
+
+    with FILE_LOCK:
+        try:
+            df = pd.read_csv(INTAKE_PATH, encoding="utf-8")
+        except Exception:
+            df = pd.read_csv(INTAKE_PATH, encoding="latin-1")
+
+        if "__batch_id" not in df.columns:
+            return Response(json.dumps({"ok": False, "error": "intake missing __batch_id"}), mimetype="application/json", status=500)
+
+        sub = df[df["__batch_id"].astype(str) == bid].copy()
+        pending = sub[sub["__status"].astype(str).str.upper().eq("PENDING")].copy()
+
+        now_epoch = time.time()
+        if pending.empty:
+            return Response(json.dumps({"ok": False, "error": "no pending rows"}), mimetype="application/json", status=409)
+
+        pu = pd.to_numeric(pending.get("__pending_until_epoch", ""), errors="coerce")
+
+        ts = pd.to_datetime(pending.get("__submitted_at", ""), errors="coerce")
+        ts = ts.fillna(pd.Timestamp("1970-01-01"))
+        submitted_epoch = ts.astype("int64") / 1e9
+
+        fallback_until = submitted_epoch + float(PENDING_GRACE_SECONDS)
+        pu = pu.fillna(fallback_until)
+
+        current_until = float(pu.min())
+        remaining = current_until - float(now_epoch)
+
+        if remaining > 20:
+            return Response(
+                json.dumps({"ok": False, "error": "too_early", "remaining": remaining}),
+                mimetype="application/json",
+                status=409,
+            )
+
+        new_until = float(now_epoch) + float(PENDING_GRACE_SECONDS)
+
+        mask = df["__batch_id"].astype(str).eq(bid) & df["__status"].astype(str).str.upper().eq("PENDING")
+        df.loc[mask, "__pending_until_epoch"] = str(int(new_until))
+        df.to_csv(INTAKE_PATH, index=False, encoding="utf-8")
+
+    return Response(
+        json.dumps(
+            {
+                "ok": True,
+                "bid": bid,
+                "server_now_epoch": float(now_epoch),
+                "pending_until_epoch": float(new_until),
+            },
+            ensure_ascii=False,
+        ),
+        mimetype="application/json",
+    )
 
 
 
@@ -4506,6 +4926,7 @@ def edit_form(sid):
 
     return render_template_string(
         EDIT_FORM_HTML,
+        cot_logo_src=COT_LOGO_DATA_URI,        
         row=row,
         ok=False,
         errors=[],
@@ -4537,6 +4958,7 @@ def edit_submit(sid):
         row2 = get_intake_row_by_submission_id(sid)
         return render_template_string(
             EDIT_FORM_HTML,
+            cot_logo_src=COT_LOGO_DATA_URI,
             row=row2 or row,
             ok=ok,
             errors=[] if ok else ["Cannot delete (only PENDING rows can be deleted)."],
@@ -4583,6 +5005,7 @@ def edit_submit(sid):
     if errors:
         return render_template_string(
             EDIT_FORM_HTML,
+            cot_logo_src=COT_LOGO_DATA_URI,
             row=row,
             ok=False,
             errors=errors,
@@ -4602,6 +5025,7 @@ def edit_submit(sid):
 
     return render_template_string(
         EDIT_FORM_HTML,
+        cot_logo_src=COT_LOGO_DATA_URI,
         row=row2 or row,
         ok=ok,
         errors=[] if ok else ["Cannot edit (only PENDING rows can be edited)."],
