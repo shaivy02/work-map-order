@@ -7,6 +7,7 @@ import difflib
 import heapq
 import time
 import hashlib
+import base64
 import threading
 import subprocess
 from queue import Queue, Empty
@@ -34,6 +35,22 @@ except ImportError as e:
 # =========================================================
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+# ---------------------------
+# Branding: embed CoT logo into landing page (no extra routes needed)
+# ---------------------------
+COT_LOGO_PATH = os.path.join(BASE_DIR, "COT Logo Screenshot.png")
+
+def _load_png_data_uri(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        return "data:image/png;base64," + b64
+    except Exception:
+        return ""
+
+COT_LOGO_DATA_URI = _load_png_data_uri(COT_LOGO_PATH)
+
 
 MASTER_TRACKER_PATH = os.path.join(BASE_DIR, "MASTER TRACKER(RAW DATA).csv")
 CENTRELINE_PATH = os.path.join(BASE_DIR, "Centreline - Version 2 - 4326.csv")
@@ -2941,23 +2958,149 @@ INDEX_HTML = """
 <head>
   <meta charset="utf-8" />
   <title>Live Work Orders Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+
   <style>
-    body { font-family: Arial, sans-serif; margin: 16px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
-    code { background: #f6f6f6; padding: 2px 5px; border-radius: 4px; }
-    a.btn {
-      display:inline-block; padding:10px 12px; border-radius:10px;
-      background:#111; color:#fff; text-decoration:none; font-weight:800;
+    :root{
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --stroke: #e5e7eb;
+      --text: #111827;
+      --muted: #6b7280;
+      --brand: #005aa3;  /* CoT-ish blue */
+      --brand2:#0ea5e9;
+      --shadow: 0 18px 45px rgba(16,24,40,0.10);
+      --radius: 18px;
     }
-    .muted { color:#666; font-size: 12px; }
+    *{ box-sizing:border-box; }
+    html,body{ height:100%; }
+    body{
+      margin:0;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 450px at 10% 0%, rgba(14,165,233,0.15), transparent 55%),
+        radial-gradient(900px 450px at 90% 0%, rgba(0,90,163,0.10), transparent 55%),
+        linear-gradient(180deg, #ffffff, var(--bg));
+      padding: 28px 18px;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .card{
+      max-width: 980px;
+      margin: 0 auto;
+      border: 1px solid var(--stroke);
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 18px 18px;
+      box-shadow: var(--shadow);
+      animation: fadeIn .22s ease-out both;
+    }
+    @keyframes fadeIn{ from{ opacity:0; transform: translateY(6px);} to{ opacity:1; transform:none;} }
+
+    .top{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 14px;
+      margin-bottom: 10px;
+    }
+    .brand{
+      display:flex;
+      align-items:center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .brand img{
+      height: 42px;
+      width: auto;
+      display:block;
+      object-fit: contain;
+    }
+    .titleWrap{ min-width:0; }
+    h2{ margin:0; font-size: 20px; font-weight: 950; letter-spacing: -0.02em; }
+    .sub{ margin-top:4px; color: var(--muted); font-weight: 650; font-size: 13px; }
+
+    .stats{
+      display:grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .stat{
+      border: 1px solid var(--stroke);
+      border-radius: 16px;
+      padding: 10px 12px;
+      background: #fbfdff;
+    }
+    .stat .k{ color: var(--muted); font-size: 12px; font-weight: 800; }
+    .stat .v{ margin-top: 4px; font-size: 14px; font-weight: 950; }
+
+    a{ color: var(--brand); text-decoration:none; font-weight: 800; }
+    a:hover{ text-decoration: underline; }
+
+    a.btn{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:10px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(0,90,163,0.20);
+      background: linear-gradient(135deg, var(--brand), var(--brand2));
+      color: #fff;
+      text-decoration:none;
+      font-weight: 950;
+      box-shadow: 0 14px 34px rgba(0,90,163,0.18);
+      transition: transform .12s ease, filter .12s ease;
+      user-select:none;
+    }
+    a.btn:hover{ transform: translateY(-1px); filter: brightness(1.03); text-decoration:none; }
+    a.btn:active{ transform: translateY(0px) scale(.99); }
+
+    code{
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      color: #111827;
+    }
+
+    .muted{ color: var(--muted); font-size: 12px; font-weight: 650; }
+
+    @media (max-width: 820px){
+      .stats{ grid-template-columns: 1fr; }
+      .top{ flex-direction: column; align-items:flex-start; }
+    }
   </style>
+
+
 </head>
 <body>
-  <div class="card">
-    <h2 style="margin:0 0 6px 0;">Live Work Orders Map</h2>
-    <p><b>Status:</b> {{ status }}</p>
-    <p><b>Last build:</b> {{ last_build }}</p>
-    <p><b>Master rows:</b> {{ master_rows }} | <b>Drawn:</b> {{ drawn }} | <b>Skipped:</b> {{ skipped }}</p>
+    <div class="card">
+    <div class="top">
+      <div class="brand">
+        {% if cot_logo_src %}
+          <img src="{{ cot_logo_src }}" alt="City of Toronto">
+        {% endif %}
+        <div class="titleWrap">
+          <h2>Live Work Orders Map</h2>
+          <div class="sub">Internal operations tool</div>
+        </div>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">Status</div><div class="v">{{ status }}</div></div>
+      <div class="stat"><div class="k">Last build</div><div class="v">{{ last_build }}</div></div>
+      <div class="stat"><div class="k">Master / Drawn / Skipped</div><div class="v">{{ master_rows }} / {{ drawn }} / {{ skipped }}</div></div>
+    </div>
+
     <p>
       Open map:
       <a href="/outputs/work_orders_map.html" target="_blank" rel="noopener noreferrer">work_orders_map.html</a>
@@ -2980,58 +3123,333 @@ NEW_FORM_HTML = """
 <head>
   <meta charset="utf-8" />
   <title>Add Work Orders (Batch)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
   <style>
-    body { font-family: Arial, sans-serif; margin: 16px; max-width: 1100px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
-    .help { color:#555; font-size: 13px; margin-top: 6px; }
-    .err { background:#ffecec; border:1px solid #ffb2b2; padding:10px; border-radius:10px; }
-    .ok  { background:#eaffea; border:1px solid #a6e6a6; padding:12px; border-radius:12px; }
-    button {
-      padding: 10px 12px; border-radius: 10px;
-      border: none; background: #111; color: #fff; font-size: 14px; font-weight: 900;
-      cursor: pointer;
+    :root{
+      --bg:#f5f7fb;
+      --card:#ffffff;
+      --stroke:#e5e7eb;
+      --text:#111827;
+      --muted:#6b7280;
+      --brand:#005aa3;
+      --brand2:#0ea5e9;
+      --danger:#dc2626;
+      --shadow: 0 18px 45px rgba(16,24,40,0.10);
+      --radius: 18px;
     }
-    .ghost { background:#f2f2f2; color:#111; }
-    input, select {
-      width: 100%; padding: 9px 10px; border-radius: 10px;
-      border: 1px solid #ccc; font-size: 14px;
+    *{ box-sizing:border-box; }
+    html,body{ height:100%; }
+    body{
+      margin:0;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 450px at 10% 0%, rgba(14,165,233,0.15), transparent 55%),
+        radial-gradient(900px 450px at 90% 0%, rgba(0,90,163,0.10), transparent 55%),
+        linear-gradient(180deg, #ffffff, var(--bg));
+      padding: 22px 16px;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
     }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { border-bottom: 1px solid #eee; padding: 8px; vertical-align: top; }
-    th { text-align: left; font-size: 12px; color:#333; }
-    code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
-    a { color:#111; }
-    .pill {
-      display:inline-block; padding: 3px 8px; border-radius: 999px;
-      background:#111; color:#fff; font-size: 12px; font-weight: 900;
+
+    .card{
+      max-width: 1200px;
+      margin: 0 auto 14px auto;
+      border: 1px solid var(--stroke);
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 16px 16px;
+      box-shadow: var(--shadow);
     }
-    .rowBtns { display:flex; gap:8px; margin-top: 10px; }
-    
-    /* Countdown agitation */
-    .timerWarn {
-        border-color: rgba(220, 0, 0, 0.35) !important;
-        background: rgba(255, 235, 235, 0.95) !important;
-        animation: pulseWarn 0.6s infinite;
+
+    h2{ margin:0 0 6px 0; font-size: 20px; font-weight: 950; letter-spacing:-0.02em; }
+    .help{ color: var(--muted); font-size: 13px; margin-top: 6px; font-weight: 650; }
+
+    a{ color: var(--brand); text-decoration:none; font-weight: 850; }
+    a:hover{ text-decoration: underline; }
+
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(0,90,163,0.22);
+      background: rgba(0,90,163,0.08);
+      color: #0b2b4a;
+      font-size: 12px;
+      font-weight: 900;
     }
-    .timerFinal {
-        animation: pulseWarn 0.35s infinite, shakeWarn 0.35s infinite;
+
+    .err{
+      background: rgba(220,38,38,0.08);
+      border: 1px solid rgba(220,38,38,0.22);
+      padding: 12px;
+      border-radius: 14px;
+      color: #7f1d1d;
+      font-weight: 750;
+      overflow-wrap: anywhere;
     }
-    #pendingTimer {
-        font-variant-numeric: tabular-nums;
+    .ok{
+      background: rgba(14,165,233,0.06);
+      border: 1px solid rgba(14,165,233,0.18);
+      padding: 12px;
+      border-radius: 14px;
+      color: #0b2b4a;
+      font-weight: 750;
+      overflow: hidden;            /* fixes “not fitting inside borders” */
+      overflow-wrap: anywhere;     /* prevents long text overflow */
     }
-    @keyframes pulseWarn {
-        0%   { transform: scale(1); }
-        50%  { transform: scale(1.02); }
-        100% { transform: scale(1); }
+
+    button{
+      padding: 11px 13px;
+      border-radius: 14px;
+      border: 1px solid rgba(0,90,163,0.20);
+      background: linear-gradient(135deg, var(--brand), var(--brand2));
+      color:#fff;
+      font-weight: 950;
+      cursor:pointer;
+      box-shadow: 0 14px 34px rgba(0,90,163,0.18);
+      transition: transform .12s ease, filter .12s ease;
+      user-select:none;
     }
-    @keyframes shakeWarn {
-        0% { transform: translateX(0); }
-        25% { transform: translateX(-2px); }
-        50% { transform: translateX(2px); }
-        75% { transform: translateX(-2px); }
-        100% { transform: translateX(0); }
+    button:hover{ transform: translateY(-1px); filter: brightness(1.03); }
+    button:active{ transform: translateY(0px) scale(.99); }
+    .ghost{
+      background:#f3f4f6;
+      border: 1px solid #e5e7eb;
+      color:#111827;
+      box-shadow:none;
+    }
+
+    /* Inputs */
+    input, select, textarea{
+      width: 100%;
+      padding: 10px 11px;
+      border-radius: 12px;
+      border: 1px solid #d1d5db;
+      background: #ffffff;
+      color: #111827;
+      font-size: 14px;
+      font-weight: 650;
+      outline: none;
+      transition: border-color .12s ease, box-shadow .12s ease;
+      min-width: 0;
+    }
+    textarea{
+      min-height: 110px; /* bigger comments box */
+      resize: vertical;
+      line-height: 1.3;
+    }
+    input:focus, select:focus, textarea:focus{
+      border-color: rgba(0,90,163,0.45);
+      box-shadow: 0 0 0 4px rgba(14,165,233,0.16);
+    }
+    select, option{ color:#111827; background:#ffffff; } /* fixes “selected option not showing” */
+
+    /* ===== Timer styling ===== */
+    #pendingTimerBox{
+      border: 1px solid var(--stroke) !important;
+      background: #f9fafb !important;
+      border-radius: 16px !important;
+    }
+    #pendingTimer{
+      font-variant-numeric: tabular-nums;
+      font-weight: 950;
+      color: #6b7280;  /* grey until last 10 seconds */
+    }
+    #pendingTimer.timerWarn,
+    #pendingTimer.timerFinal{
+      color: var(--danger); /* red in last 10 seconds */
+    }
+    .timerWarn{
+      animation: pulseWarn 0.9s infinite;
+    }
+    .timerFinal{
+      animation: pulseWarn 0.35s infinite, shakeWarn 0.35s infinite;
+    }
+    @keyframes pulseWarn{ 0%{transform:scale(1)} 50%{transform:scale(1.03)} 100%{transform:scale(1)} }
+    @keyframes shakeWarn{ 0%{transform:translateX(0)} 25%{transform:translateX(-2px)} 50%{transform:translateX(2px)} 75%{transform:translateX(-2px)} 100%{transform:translateX(0)} }
+
+    /* ===== Submitted “batch” table (the top table) — make it wrap and fit ===== */
+    table:not(#woTable){
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      margin-top: 10px;
+      background: #ffffff;
+      border: 1px solid var(--stroke);
+      border-radius: 16px;
+      overflow: hidden;
+    }
+    table:not(#woTable) thead{ display:none; } /* avoids horizontal scroll */
+    table:not(#woTable) tbody tr{
+      display:grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px 12px;
+      padding: 12px;
+      border-bottom: 1px solid var(--stroke);
+    }
+    table:not(#woTable) tbody tr:last-child{ border-bottom:none; }
+    table:not(#woTable) tbody td{
+      border:none;
+      padding:0;
+      display:flex;
+      flex-direction:column;
+      gap: 6px;
+      min-width: 0;
+    }
+    table:not(#woTable) tbody td::before{
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 900;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      content: "";
+    }
+    table:not(#woTable) tbody td:nth-child(1)::before{ content:"WO"; }
+    table:not(#woTable) tbody td:nth-child(2)::before{ content:"Date"; }
+    table:not(#woTable) tbody td:nth-child(3)::before{ content:"District"; }
+    table:not(#woTable) tbody td:nth-child(4)::before{ content:"Ward"; }
+    table:not(#woTable) tbody td:nth-child(5)::before{ content:"Supervisor"; }
+    table:not(#woTable) tbody td:nth-child(6)::before{ content:"Shift"; }
+    table:not(#woTable) tbody td:nth-child(7)::before{ content:"Type"; }
+    table:not(#woTable) tbody td:nth-child(8)::before{ content:"Dump Trucks"; }
+    table:not(#woTable) tbody td:nth-child(9)::before{ content:"Provider"; }
+    table:not(#woTable) tbody td:nth-child(10)::before{ content:"Loads"; }
+    table:not(#woTable) tbody td:nth-child(11)::before{ content:"Tonnes"; }
+    table:not(#woTable) tbody td:nth-child(12)::before{ content:"Side"; }
+    table:not(#woTable) tbody td:nth-child(13)::before{ content:"Road Side"; }
+    table:not(#woTable) tbody td:nth-child(14)::before{ content:"Snow Dump Site"; }
+    table:not(#woTable) tbody td:nth-child(15)::before{ content:"Comments"; }
+    table:not(#woTable) tbody td:nth-child(16)::before{ content:"Location"; }
+    table:not(#woTable) tbody td:nth-child(17)::before{ content:"From"; }
+    table:not(#woTable) tbody td:nth-child(18)::before{ content:"To"; }
+    table:not(#woTable) tbody td:nth-child(19)::before{ content:"Status"; }
+    table:not(#woTable) tbody td:nth-child(20)::before{ content:"Edit"; }
+
+    table:not(#woTable) tbody td:nth-child(15),
+    table:not(#woTable) tbody td:nth-child(16),
+    table:not(#woTable) tbody td:nth-child(17),
+    table:not(#woTable) tbody td:nth-child(18){
+      grid-column: 1 / -1; /* long text fields full width */
+    }
+
+    /* ===== Entry table (woTable) — convert to responsive grid cards, no horizontal scroll ===== */
+    #woTable{
+      width: 100%;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      margin-top: 10px;
+    }
+    #woTable thead{ display:none; } /* remove wide header */
+    #woTable th[style]{ width:auto !important; } /* ignore inline width styles */
+
+    #woTable tbody tr{
+      display:grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px 12px;
+      padding: 12px;
+      margin: 10px 0;
+      border: 1px solid var(--stroke);
+      border-radius: 16px;
+      background: #ffffff;
+      box-shadow: 0 10px 26px rgba(16,24,40,0.06);
+    }
+    #woTable tbody td{
+      border:none;
+      padding:0;
+      display:flex;
+      flex-direction:column;
+      gap: 6px;
+      min-width: 0;
+    }
+    #woTable tbody td::before{
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 900;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      content: "";
+    }
+
+    /* Labels by column (matches your addRow() order) */
+    #woTable tbody td:nth-child(1)::before{ content:"WO"; }
+    #woTable tbody td:nth-child(2)::before{ content:"Date"; }
+    #woTable tbody td:nth-child(3)::before{ content:"District"; }
+    #woTable tbody td:nth-child(4)::before{ content:"Ward"; }
+    #woTable tbody td:nth-child(5)::before{ content:"Supervisor"; }
+    #woTable tbody td:nth-child(6)::before{ content:"Shift"; }
+    #woTable tbody td:nth-child(7)::before{ content:"Type"; }
+    #woTable tbody td:nth-child(8)::before{ content:"Dump Trucks"; }
+    #woTable tbody td:nth-child(9)::before{ content:"Provider"; }
+    #woTable tbody td:nth-child(10)::before{ content:"Loads"; }
+    #woTable tbody td:nth-child(11)::before{ content:"Tonnes"; }
+    #woTable tbody td:nth-child(12)::before{ content:"Side"; }
+    #woTable tbody td:nth-child(13)::before{ content:"Road Side"; }
+    #woTable tbody td:nth-child(14)::before{ content:"Snow Dump Site"; }
+    #woTable tbody td:nth-child(15)::before{ content:"Comments"; }
+    #woTable tbody td:nth-child(16)::before{ content:"Location"; }
+    #woTable tbody td:nth-child(17)::before{ content:"From"; }
+    #woTable tbody td:nth-child(18)::before{ content:"To"; }
+    #woTable tbody td:nth-child(19)::before{ content:"Remove"; }
+
+    /* Field sizing + spans (fixes your “too small / too big” complaints) */
+    #woTable tbody td:nth-child(1){ grid-column: span 2; }  /* WO bigger (20-digit visible) */
+    #woTable tbody td:nth-child(5){ grid-column: span 2; }  /* Supervisor bigger */
+    #woTable tbody td:nth-child(7){ grid-column: span 2; }  /* Type bigger */
+    #woTable tbody td:nth-child(9){ grid-column: span 2; }  /* Provider bigger */
+
+    #woTable tbody td:nth-child(15){ grid-column: 1 / -1; } /* Comments full width */
+    #woTable tbody td:nth-child(16){ grid-column: span 2; } /* Location bigger */
+    #woTable tbody td:nth-child(17){ grid-column: span 2; } /* From bigger */
+    #woTable tbody td:nth-child(18){ grid-column: span 2; } /* To bigger */
+
+    /* Make dump trucks feel “small”, loads readable */
+    #woTable tbody td:nth-child(8) input{ text-align:right; }
+    #woTable tbody td:nth-child(10) input{ text-align:right; } /* Loads */
+    #woTable tbody td:nth-child(11) input{ text-align:right; } /* Tonnes */
+
+    /* Make WO field monospaced-ish readability */
+    #woTable tbody td:nth-child(1) input{
+      font-variant-numeric: tabular-nums;
+      font-weight: 850;
+    }
+
+    /* Remove button */
+    .rmBtn{
+      width: 100%;
+      border-radius: 14px;
+      padding: 11px 12px;
+      border: 1px solid rgba(220,38,38,0.25);
+      background: rgba(220,38,38,0.06);
+      color: #7f1d1d;
+      font-weight: 950;
+      cursor:pointer;
+    }
+    .rmBtn:hover{ background: rgba(220,38,38,0.10); }
+
+    /* Ensure crosslist host stays hidden */
+    #crossLists{ display:none; }
+
+    /* Responsive grid */
+    @media (max-width: 1100px){
+      #woTable tbody tr{ grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      #woTable tbody td:nth-child(15){ grid-column: 1 / -1; }
+    }
+    @media (max-width: 720px){
+      #woTable tbody tr{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #woTable tbody td:nth-child(15),
+      #woTable tbody td:nth-child(16),
+      #woTable tbody td:nth-child(17),
+      #woTable tbody td:nth-child(18){ grid-column: 1 / -1; }
     }
   </style>
+
 </head>
 <body>
   <div class="card">
@@ -3465,18 +3883,126 @@ EDIT_FORM_HTML = """
 <head>
   <meta charset="utf-8" />
   <title>Edit Intake Work Order</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
   <style>
-    body { font-family: Arial, sans-serif; margin: 16px; max-width: 900px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
-    label { display:block; margin-top: 10px; font-weight: 800; }
-    input, select { width: 100%; padding: 10px; border-radius: 10px; border:1px solid #ccc; }
-    .help { color:#555; font-size: 13px; margin-top: 6px; }
-    .err { background:#ffecec; border:1px solid #ffb2b2; padding:10px; border-radius:10px; }
-    .ok  { background:#eaffea; border:1px solid #a6e6a6; padding:12px; border-radius:12px; }
-    button { margin-top: 14px; padding: 12px 14px; border-radius: 12px; border:none; background:#111; color:#fff; font-weight:900; cursor:pointer; }
-    .ghost { background:#f2f2f2; color:#111; }
-    code { background:#f6f6f6; padding:2px 6px; border-radius:6px; }
+    :root{
+      --bg:#f5f7fb;
+      --card:#ffffff;
+      --stroke:#e5e7eb;
+      --text:#111827;
+      --muted:#6b7280;
+      --brand:#005aa3;
+      --brand2:#0ea5e9;
+      --danger:#dc2626;
+      --shadow: 0 18px 45px rgba(16,24,40,0.10);
+      --radius: 18px;
+    }
+    *{ box-sizing:border-box; }
+    html,body{ height:100%; }
+    body{
+      margin:0;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 450px at 10% 0%, rgba(14,165,233,0.15), transparent 55%),
+        radial-gradient(900px 450px at 90% 0%, rgba(0,90,163,0.10), transparent 55%),
+        linear-gradient(180deg, #ffffff, var(--bg));
+      padding: 22px 16px;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .card{
+      max-width: 980px;
+      margin: 0 auto 14px auto;
+      border: 1px solid var(--stroke);
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 16px 16px;
+      box-shadow: var(--shadow);
+    }
+
+    h2{ margin:0 0 6px 0; font-size: 20px; font-weight: 950; letter-spacing:-0.02em; }
+    a{ color: var(--brand); text-decoration:none; font-weight: 850; }
+    a:hover{ text-decoration: underline; }
+
+    label{ display:block; margin-top: 12px; font-weight: 900; color: #111827; }
+    input, select, textarea{
+      width: 100%;
+      padding: 10px 11px;
+      border-radius: 12px;
+      border: 1px solid #d1d5db;
+      background: #ffffff;
+      color: #111827;
+      font-size: 14px;
+      font-weight: 650;
+      outline: none;
+      transition: border-color .12s ease, box-shadow .12s ease;
+    }
+    textarea{ min-height: 140px; resize: vertical; line-height: 1.3; } /* bigger glanceable comments */
+    input:focus, select:focus, textarea:focus{
+      border-color: rgba(0,90,163,0.45);
+      box-shadow: 0 0 0 4px rgba(14,165,233,0.16);
+    }
+    select, option{ color:#111827; background:#ffffff; }
+
+    .help{ color: var(--muted); font-size: 13px; margin-top: 6px; font-weight: 650; }
+
+    .err{
+      background: rgba(220,38,38,0.08);
+      border: 1px solid rgba(220,38,38,0.22);
+      padding: 12px;
+      border-radius: 14px;
+      color: #7f1d1d;
+      font-weight: 750;
+      overflow-wrap:anywhere;
+    }
+    .ok{
+      background: rgba(14,165,233,0.06);
+      border: 1px solid rgba(14,165,233,0.18);
+      padding: 12px;
+      border-radius: 14px;
+      color: #0b2b4a;
+      font-weight: 750;
+      overflow-wrap:anywhere;
+    }
+
+    button{
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(0,90,163,0.20);
+      background: linear-gradient(135deg, var(--brand), var(--brand2));
+      color:#fff;
+      font-weight: 950;
+      cursor:pointer;
+      box-shadow: 0 14px 34px rgba(0,90,163,0.18);
+      transition: transform .12s ease, filter .12s ease;
+    }
+    button:hover{ transform: translateY(-1px); filter: brightness(1.03); }
+    button:active{ transform: translateY(0px) scale(.99); }
+    .ghost{
+      background:#f3f4f6;
+      border: 1px solid #e5e7eb;
+      color:#111827;
+      box-shadow:none;
+    }
+
+    code{
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      padding:2px 8px;
+      border-radius:999px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      color: #111827;
+    }
   </style>
+
+
 </head>
 <body>
   <div class="card">
@@ -3614,6 +4140,7 @@ EDIT_FORM_HTML = """
 def home():
     return render_template_string(
         INDEX_HTML,
+        cot_logo_src=COT_LOGO_DATA_URI,
         status=latest_build_stats.get("status", ""),
         last_build=latest_build_stats.get("last_build", ""),
         master_rows=latest_build_stats.get("master_rows", ""),
