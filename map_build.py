@@ -82,6 +82,18 @@ SEGMENT_OPACITY = 0.01
 SEGMENT_WEIGHT = 12
 
 # =========================================================
+# HARD-CODED DISTRICTS (used in /new and /edit dropdowns)
+# =========================================================
+DISTRICTS= [
+    "EY",
+    "NY",
+    "SC",
+    "TEY",
+    # add more here if needed
+]
+
+
+# =========================================================
 # District → Ward dependency (UI + validation)
 # =========================================================
 DISTRICT_TO_WARDS = {
@@ -165,7 +177,7 @@ PENDING_GRACE_SECONDS = 60  # keep rows editable for 60s before they can be appl
 UI_USER = os.environ.get("WO_UI_USER", "").strip()
 UI_PASS = os.environ.get("WO_UI_PASS", "").strip()
 
-STRICT_DISTRICTS = []
+STRICT_DISTRICTS = ["EY", "NY", "SC", "TEY"]
 STRICT_WARDS = []
 STRICT_SUPERVISORS = []
 STRICT_SHIFTS = []
@@ -4933,7 +4945,7 @@ def new_form():
         apply_in_seconds=apply_in_seconds,
         inserted_count=len([r for r in batch if r.get("__status","").strip()]),
         intake_poll_seconds=INTAKE_POLL_SECONDS,
-        districts=latest_allowed_sets.get("District\n", []),
+        districts=DISTRICTS,
         supervisors=latest_allowed_sets.get("Supervisor\n", []),
         shifts=latest_allowed_sets.get("Shift\n", []),
         types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
@@ -4944,7 +4956,7 @@ def new_form():
         snow_dump_sites_html="".join(
             f"<option>{html.escape(x)}</option>" for x in SNOW_DUMP_SITES
         ),        
-        districts_json=json.dumps(latest_allowed_sets.get("District\n", [])),
+        districts_json=json.dumps(DISTRICTS),
         shifts_json=json.dumps(latest_allowed_sets.get("Shift\n", [])),
         types_json=json.dumps(latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", [])),
         district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
@@ -5009,14 +5021,13 @@ def new_submit():
             batch_id="",
             inserted_count=0,
             intake_poll_seconds=INTAKE_POLL_SECONDS,
-            districts=latest_allowed_sets.get("District\n", []),
-            supervisors=latest_allowed_sets.get("Supervisor\n", []),
+            districts=DISTRICTS,            supervisors=latest_allowed_sets.get("Supervisor\n", []),
             shifts=latest_allowed_sets.get("Shift\n", []),
             types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
             streets=latest_centre_streets,
             dump_truck_providers_html="".join(f"<option>{html.escape(x)}</option>" for x in DUMP_TRUCK_PROVIDERS),
             snow_dump_sites_html="".join(f"<option>{html.escape(x)}</option>" for x in SNOW_DUMP_SITES),                
-            districts_json=json.dumps(latest_allowed_sets.get("District\n", [])),
+            districts_json=json.dumps(DISTRICTS),            
             shifts_json=json.dumps(latest_allowed_sets.get("Shift\n", [])),
             types_json=json.dumps(latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", [])),
             district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
@@ -5075,14 +5086,14 @@ def new_submit():
             batch_id="",
             inserted_count=0,
             intake_poll_seconds=INTAKE_POLL_SECONDS,
-            districts=latest_allowed_sets.get("District\n", []),
+            districts=DISTRICTS,
             supervisors=latest_allowed_sets.get("Supervisor\n", []),
             shifts=latest_allowed_sets.get("Shift\n", []),
             types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
             streets=latest_centre_streets,
             dump_truck_providers_html="".join(f"<option>{html.escape(x)}</option>" for x in DUMP_TRUCK_PROVIDERS),
             snow_dump_sites_html="".join(f"<option>{html.escape(x)}</option>" for x in SNOW_DUMP_SITES),
-            districts_json=json.dumps(latest_allowed_sets.get("District\n", [])),
+            districts_json=json.dumps(DISTRICTS),            
             shifts_json=json.dumps(latest_allowed_sets.get("Shift\n", [])),
             types_json=json.dumps(latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", [])),
             prefill_rows_json=json.dumps(prefill_rows),
@@ -5307,7 +5318,7 @@ def edit_form(sid):
         row=row,
         ok=False,
         errors=[],
-        districts=latest_allowed_sets.get("District\n", []),
+        districts=DISTRICTS,
         wards=wards_for_district(row.get("District\n", "")) or latest_allowed_sets.get("Ward\n", []),
         supervisors=latest_allowed_sets.get("Supervisor\n", []),
         streets=latest_centre_streets,
@@ -5339,7 +5350,7 @@ def edit_submit(sid):
             row=row2 or row,
             ok=ok,
             errors=[] if ok else ["Cannot delete (only PENDING rows can be deleted)."],
-            districts=latest_allowed_sets.get("District\n", []),
+            districts=DISTRICTS,
             wards=wards_for_district((row2 or row).get("District\n", "")) or latest_allowed_sets.get("Ward\n", []),
             supervisors=latest_allowed_sets.get("Supervisor\n", []),
             streets=latest_centre_streets,
@@ -5386,7 +5397,7 @@ def edit_submit(sid):
             row=row,
             ok=False,
             errors=errors,
-            districts=latest_allowed_sets.get("District\n", []),
+            districts=DISTRICTS,
             wards=allowed_sets.get("Ward\n", []),
             supervisors=latest_allowed_sets.get("Supervisor\n", []),
             streets=latest_centre_streets,
@@ -5406,7 +5417,7 @@ def edit_submit(sid):
         row=row2 or row,
         ok=ok,
         errors=[] if ok else ["Cannot edit (only PENDING rows can be edited)."],
-        districts=latest_allowed_sets.get("District\n", []),
+        districts=DISTRICTS,
         wards=wards_for_district((row2 or row).get("District\n", "")) or latest_allowed_sets.get("Ward\n", []),
         supervisors=latest_allowed_sets.get("Supervisor\n", []),
         streets=latest_centre_streets,
