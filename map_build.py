@@ -15,6 +15,7 @@ from datetime import datetime
 from collections import defaultdict, Counter
 
 import pandas as pd
+from openpyxl import load_workbook
 import folium
 from folium import plugins
 
@@ -22,7 +23,7 @@ from folium import plugins
 # Optional web server (for live updates)
 # ---------------------------
 try:
-    from flask import Flask, Response, send_from_directory, render_template_string, request
+    from flask import Flask, Response, send_from_directory, render_template_string, request, redirect
 except ImportError as e:
     raise SystemExit(
         "\nFlask is required for live hosting.\n"
@@ -52,7 +53,13 @@ def _load_png_data_uri(path: str) -> str:
 COT_LOGO_DATA_URI = _load_png_data_uri(COT_LOGO_PATH)
 
 
-MASTER_TRACKER_PATH = os.path.join(BASE_DIR, "MASTER TRACKER(RAW DATA).csv")
+MASTER_TRACKER_PATH = os.path.join(BASE_DIR, "Snow Removal Master Tracker.xlsx")
+MASTER_SHEET_NAME = "Data Input"
+
+# Reference intersections (used for Street + From/To picklists and optional IDs)
+INTERSECTION_REF_PATH = os.path.join(BASE_DIR, "Centreline Intersection - 4326.csv")
+
+# Routing graph centreline (still used for exact segment plotting)
 CENTRELINE_PATH = os.path.join(BASE_DIR, "Centreline - Version 2 - 4326.csv")
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs_work_orders")
@@ -307,98 +314,329 @@ def file_fingerprint(path: str):
     sha = sha256_of_file(path)
     return (mtime, size, sha)
 
+# ---------------------------
+# Street name normalization (shared)
+# ---------------------------
+_ABBREV_REPLACEMENTS = [
+    # NOTE: We intentionally do NOT globally expand 'ST' because in Toronto
+    # it can mean either 'STREET' (suffix) or 'SAINT' (prefix, e.g., ST CLAIR).
+    # Prefix handling (ST/SAINT/STREET) is done in normalize_street_name() before these.
+
+    (r"\bAVE\b", "AVENUE"),
+    (r"\bRD\b", "ROAD"),
+    (r"\bBLVD\b", "BOULEVARD"),
+    (r"\bDR\b", "DRIVE"),
+    (r"\bCRES\b", "CRESCENT"),
+    (r"\bPL\b", "PLACE"),
+    (r"\bCRT\b", "COURT"),
+    (r"\bPKWY\b", "PARKWAY"),
+    (r"\bHWY\b", "HIGHWAY"),
+    
+    # Normalize directional suffixes (must come after street type expansions)
+    (r"\bEAST$", "E"),
+    (r"\bWEST$", "W"),
+    (r"\bNORTH$", "N"),
+    (r"\bSOUTH$", "S"),
+]
+
+
+def normalize_street_name(name: str) -> str:
+    """Normalize street/cross-street labels into a consistent uppercase key.
+
+    This is used across:
+      - centreline routing graph build
+      - Centreline Intersection reference lookup
+      - UI cross-street suggestions
+    """
+    s = str(name or '').upper().strip()
+    if not s or s in ('NAN', 'NONE'):
+        return ''
+
+    # Strip leading address numbers (e.g., "3409 ST CLAIR AVE" -> "ST CLAIR AVE")
+    s = re.sub(r'^\d+\s+', '', s)
+
+    # Collapse whitespace and punctuation variants
+    s = s.replace('-', ' ')
+    s = re.sub(r"\s+", ' ', s).strip()
+
+    # Drop common prefixes/suffixes that break matching
+    s = re.sub(r"^THE\s+", '', s).strip()
+
+    # Normalize abbreviations
+
+    # ---------------------------
+    # Toronto-specific ST/SAINT/STREET handling
+    #
+    # Canonical form (for *SAINT* streets): keep them as prefix "ST <NAME>" (NOT "SAINT").
+    # Example: "SAINT CLAIR AVENUE W" -> "ST CLAIR AVENUE W".
+    #
+    # Suffix road-type abbreviation handling:
+    #   - "... ST" or "... ST W" -> "... STREET" / "... STREET W".
+    #
+    # Also repair the common user mistake where "ST" (Saint) is accidentally expanded to
+    # "STREET" as a *prefix name token* (e.g., "STREET CLAIR" -> "ST CLAIR").
+
+    # Canonicalize prefix SAINT to ST
+    s = re.sub(r"^SAINT\s+", "ST ", s)
+
+    # Ensure prefix ST variants stay ST
+    s = re.sub(r"^ST\.?\s+", "ST ", s)
+
+    # Convert bad expansions like "STREET CLAIR" -> "ST CLAIR" (only when STREET is a prefix name token)
+    road_types = {"STREET","ROAD","AVENUE","BOULEVARD","DRIVE","CRESCENT","PLACE","COURT","PARKWAY","HIGHWAY","LANE","TERRACE","CIRCLE","WAY","GROVE","GATE","TRAIL","CLOSE","ROW","SQUARE","PARK","PROMENADE"}
+    if s.startswith("STREET "):
+        parts = s.split()
+        if len(parts) >= 2 and parts[1] not in road_types:
+            s = "ST " + " ".join(parts[1:])
+
+    # Normalize suffix street abbreviation " ST" (including before direction tokens)
+    # Examples: "BATHURST ST" -> "BATHURST STREET", "QUEEN ST W" -> "QUEEN STREET W"
+    s = re.sub(r"\bST\b(?=(\s+[NSEW])?\s*$)", "STREET", s)
+
+    for pat, rep in _ABBREV_REPLACEMENTS:
+
+        s = re.sub(pat, rep, s)
+
+    # Handle slashes used in intersection descriptors (keep tokens clean)
+    s = s.replace(' / ', '/').replace('/ ', '/').replace(' /', '/')
+
+    return s
+
+def endpoint_cross_candidates(street_val, endpoint_val):
+    """Return candidate cross-street names for an endpoint field.
+
+    Accepts endpoint values like:
+      - 'CROSS ST'
+      - 'STREET / CROSS'
+      - 'A / B / C' (3-way)
+
+    Returns a list of *normalized* street-name tokens to try as the cross street.
+
+    For 3-way values, we treat the token most similar to the selected Street as the
+    "main" street, and the remaining two tokens as candidate cross streets.
+    """
+    s_norm = normalize_street_name(street_val or '')
+    raw = ('' if endpoint_val is None else str(endpoint_val)).strip()
+    if not raw or raw.lower() == 'nan':
+        return []
+
+    # --- Special case (Toronto): same-street E/W variants used as endpoints ---
+    # Example seen in the master tracker:
+    #   Location: "ST CLAIR AVENUE W"
+    #   From:     "ST CLAIR AVENUE E"
+    # In reality, this means "start at the E/W split point".
+    # In Toronto core, many major streets split at Yonge (Bloor, Queen, King, St Clair, etc.).
+    # If the endpoint is the *same base street* as the Location, but with a *different* direction
+    # designator, treat the cross street as YONGE STREET.
+    def _dir_token(s: str):
+        parts = (s or "").split()
+        if not parts:
+            return None
+        last = parts[-1]
+        if last in {"E", "W", "N", "S"}:
+            return last
+        if len(parts) >= 2 and parts[-2] in {"E", "W", "N", "S"}:
+            # e.g., "STREET W" already normalized into two tokens
+            return parts[-2]
+        return None
+
+    def _strip_dir(s: str):
+        parts = (s or "").split()
+        if parts and parts[-1] in {"E", "W", "N", "S"}:
+            parts = parts[:-1]
+        return " ".join(parts).strip()
+
+    try:
+        ep_norm = normalize_street_name(raw)
+        if ep_norm:
+            base_loc = _strip_dir(s_norm)
+            base_ep = _strip_dir(ep_norm)
+            d_loc = _dir_token(s_norm)
+            d_ep = _dir_token(ep_norm)
+            if base_loc and base_ep and base_loc == base_ep and d_loc and d_ep and d_loc != d_ep:
+                # Try both spelling variants for safety
+                return [normalize_street_name("YONGE STREET"), normalize_street_name("YONGE ST")]
+    except Exception:
+        pass
+
+    # Normalize slash spacing but keep tokens
+    raw_fixed = raw.replace(' / ', '/').replace('/ ', '/').replace(' /', '/')
+    if '/' not in raw_fixed:
+        v = normalize_street_name(raw_fixed)
+        return [v] if v else []
+
+    toks_raw = [t.strip() for t in raw_fixed.split('/') if t.strip()]
+    toks = [normalize_street_name(t) for t in toks_raw]
+    toks = [t for t in toks if t]
+    if not toks:
+        return []
+
+    # 2-token case: prefer the side that isn't the selected Street
+    if len(toks) == 2:
+        a, b = toks
+        if a == s_norm and b:
+            return [b]
+        if b == s_norm and a:
+            return [a]
+        # Similarity fallback (handles ST/AVE expansions etc.)
+        try:
+            if similarity(a, s_norm) >= 0.88 and b:
+                return [b]
+            if similarity(b, s_norm) >= 0.88 and a:
+                return [a]
+        except Exception:
+            pass
+        # Ambiguous: try both
+        out = []
+        if a:
+            out.append(a)
+        if b and b not in out:
+            out.append(b)
+        return out
+
+    # 3+ token case: choose token most similar to Street as the main street, return the rest
+    scores = []
+    for t in toks:
+        try:
+            sc = similarity(t, s_norm) if s_norm else 0.0
+        except Exception:
+            sc = 0.0
+        scores.append(sc)
+
+    if s_norm and s_norm in toks:
+        main_idx = toks.index(s_norm)
+    else:
+        main_idx = max(range(len(toks)), key=lambda i: scores[i])
+
+    out = []
+    for i, t in enumerate(toks):
+        if i == main_idx:
+            continue
+        if t and t not in out:
+            out.append(t)
+
+    return out
+
+
+
 
 # =========================================================
 # 3. INTAKE SYSTEM
 # =========================================================
 
 MASTER_COLUMNS = [
-    # === EXISTING (DO NOT MOVE) ===
-    "WO",
-    "District\n",
-    "Ward\n",
-    "Date\n",
-    "Shift\n",
-    "Supervisor\n",
-    "Location",
-    "From ",
-    "To",
-    "Type (Road Class/ School, Bridge)\n",
-
-    # === NEW — ADMIN / OPS FIELDS ===
-    "Shift Start Date and Time",
-    "Shift End Date and Time",
-    "Hours Worked",
-
-    "Supervisor 1",
-    "Supervisor 2",
-    "Supervisor 3",
-
+    # === Snow Removal Master Tracker (Data Input sheet) columns ===
+    "Work Order Number",
+    "District (Where Snow Removed)",
+    "Ward (Where Snow Removed)",
+    "TOA Area (Where Snow Removed)",
+    "Street",
+    "From Intersection",
+    "To Intersection",
+    "From Intersection ID",
+    "To Intersection ID",
+    "One Side / Both Sides Cleared?",
+    "Side of Road Cleared",
+    "Infrastructure Type: Roadway",
+    "Infrastructure Type: Sidewalk",
+    "Infrastructure Type: Separated Cycling Infrastructure",
+    "Infrastructure Type: Bridge",
+    "Infrastructure Type: School Loading Zones",
+    "Clearing Activity: Plow",
+    "Clearing Activity: Plow Only",
+    "Clearing Activity: Windrow",
+    "Clearing Activity: Sidewalk Plow",
+    "Clearing Activity: Sidewalk Windrow",
+    "Clearing Activity: Salting",
+    "Clearing Activity: Anti-Icing",
+    "Clearing Activity: Snow Removal",
+    "Clearing Activity: Hauling",
+    "Clearing Activity: Blowing",
+    "Clearing Activity: Other",
+    "Clearing Activity: Other Notes",
     "Equipment Method",
-    "Contracted Crew?",
-    "Contractor: # of Crews",
-    "Contractor: Crew TOA Area",
-    "Contractor: Crew Number",
-
-    "In-House: Staff Responsibility",
-    "In-House: # of Staff",
-
+    "Dump Truck Source (In-House/Contractor)",
     "# of Equipment (Dump Trucks)",
-    "Dump Truck Provider Contractor",
-
-    "RequestID",
-
+    "Snow Dump Site",
     "# of Loads",
     "Tonnes",
-
-    "One Side/ Both Sides",
-    "Side of Road Cleared",
-
-    "Snow Dumped Site",
-
-    # === NEW — COMMENTS ===
-    "Comments",
+    "Shift Start Date",
+    "Shift Start Time",
+    "Shift End Date",
+    "Shift End Time",
+    "Supervisor 1",
+    "Supervisor 2 (if relevant)",
+    "Supervisor 3 (if relevant)",
+    "Contracted Crew?",
+    "# of Crews (if relevant)",
+    "TOA Area (if relevant)",
+    "Crew Number (if relevant)",
+    "In-House: Responsibility",
+    "In-House: # of Staff",
+    "NOTES",
+    "Time and Date of Data Entry Input",
 ]
 
-
-
 FORM_TO_MASTER = {
-    "WO": "WO",
-    "District__NL": "District\n",
-    "Ward__NL": "Ward\n",
-    "Date__NL": "Date\n",
-    "Shift__NL": "Shift\n",
-    "Supervisor__NL": "Supervisor\n",
-    "Location": "Location",
-    "From": "From ",
-    "To": "To",
-    "Type__NL": "Type (Road Class/ School, Bridge)\n",
+    # Core identifiers
+    "WO": "Work Order Number",
+
+    # Admin
+    "District__NL": "District (Where Snow Removed)",
+    "Ward__NL": "Ward (Where Snow Removed)",
+    "TOA__NL": "TOA Area (Where Snow Removed)",
+
+    # New address format
+    "Street": "Street",
+    "FromIntersection": "From Intersection",
+    "ToIntersection": "To Intersection",
+
+    # Shift (UI captures a date + start/end time)
+    "Date__NL": "Shift Start Date",
+    "ShiftStart__NL": "Shift Start Time",
+    "ShiftEnd__NL": "Shift End Time",
+
+    # People
+    "Supervisor__NL": "Supervisor 1",
+
+    # Ops
+    "Equipment Method": "Equipment Method",
+    "Dump Truck Source (In-House/Contractor)": "Dump Truck Source (In-House/Contractor)",
+    "# of Equipment (Dump Trucks)": "# of Equipment (Dump Trucks)",
+    "Snow Dump Site": "Snow Dump Site",
+    "# of Loads": "# of Loads",
+    "Tonnes": "Tonnes",
+    "One Side / Both Sides Cleared?": "One Side / Both Sides Cleared?",
+    "Side of Road Cleared": "Side of Road Cleared",
+    "NOTES": "NOTES",
 }
 MASTER_TO_FORM = {v: k for k, v in FORM_TO_MASTER.items()}
 
 DISPLAY_FIELDS_FORM = [
-    "WO",
-    "District__NL",
-    "Ward__NL",
-    "Date__NL",
-    "Shift__NL",
-    "Supervisor__NL",
-    "Location",
-    "From",
-    "To",
-    "Type__NL",
-
+    "Work Order Number",
+    "Shift Start Date",
+    "District (Where Snow Removed)",
+    "Ward (Where Snow Removed)",
+    "TOA Area (Where Snow Removed)",
+    "Supervisor 1",
+    "Shift Start Time",
+    "Shift End Time",
+    "Equipment Method",
     "# of Equipment (Dump Trucks)",
-    "Dump Truck Provider Contractor",
+    "Dump Truck Source (In-House/Contractor)",
+    "Contractor: Crew TOA Area Responsibility",
+    "Snow Dump Site",
     "# of Loads",
     "Tonnes",
-    "One Side/ Both Sides",
+    "One Side / Both Sides Cleared?",
     "Side of Road Cleared",
-    "Snow Dumped Site",
-    "Comments",
-
+    "Street",
+    "From Intersection",
+    "To Intersection",
+    "NOTES",
     "__submission_id",
 ]
+
 
 def master_col_for_form_field(form_key: str) -> str:
     # FORM_TO_MASTER covers the “__NL” ones + From/To/Type etc.
@@ -439,35 +677,265 @@ def ensure_intake_file():
             log("INTAKE: patched intake file to include required columns.")
 
 def ensure_master_has_columns():
+    """Legacy no-op.
+
+    The master tracker is now an Excel workbook (Snow Removal Master Tracker.xlsx)
+    with a fixed header row, so we do not patch columns in-place.
     """
-    Make sure MASTER_TRACKER_PATH contains all MASTER_COLUMNS (safe patch).
-    Without this, intake fields that don't exist in the master CSV get dropped.
+    return
+
+
+def _find_xlsx_header_row(ws, header_key: str = "Work Order Number", scan_rows: int = 30) -> int:
+    """Return 1-based row index that contains `header_key` (case-insensitive)."""
+    key = (header_key or "").strip().casefold()
+    for r in range(1, scan_rows + 1):
+        row_vals = [str(c.value).strip() if c.value is not None else "" for c in ws[r]]
+        if any(v.casefold() == key for v in row_vals):
+            return r
+    # Fallback to row 3 (this workbook uses 2 title rows + header row)
+    return 3
+
+
+def read_master_xlsx() -> pd.DataFrame:
+    """Read master rows from the Excel tracker (Data Input sheet).
+
+    - Finds the header row dynamically (looks for 'Work Order Number')
+    - Returns a DataFrame containing at least MASTER_COLUMNS (missing columns filled with '')
     """
     if not os.path.exists(MASTER_TRACKER_PATH):
-        return
+        raise FileNotFoundError(f"MASTER_TRACKER_PATH not found: {MASTER_TRACKER_PATH}")
+
+    wb = load_workbook(MASTER_TRACKER_PATH, data_only=True, read_only=False)
+    if MASTER_SHEET_NAME not in wb.sheetnames:
+        raise KeyError(f"Sheet '{MASTER_SHEET_NAME}' not found in {MASTER_TRACKER_PATH}")
+    ws = wb[MASTER_SHEET_NAME]
+    header_row = _find_xlsx_header_row(ws)
+
+    # pandas header is 0-based index
+    df = pd.read_excel(MASTER_TRACKER_PATH, sheet_name=MASTER_SHEET_NAME, header=header_row - 1)
+
+    # Drop completely empty rows
+    if len(df):
+        # If WO is blank, treat as empty row
+        wo_col = "Work Order Number"
+        if wo_col in df.columns:
+            df = df[~df[wo_col].isna()].copy()
+
+    # Ensure required cols
+    for c in MASTER_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+
+    return df
+
+
+def append_rows_to_master_xlsx(rows: list) -> int:
+    """Append list[dict] rows (MASTER_COLUMNS keys) into the Excel tracker.
+
+    Returns number of appended rows.
+    """
+    if not rows:
+        return 0
+
+    if not os.path.exists(MASTER_TRACKER_PATH):
+        raise FileNotFoundError(f"MASTER_TRACKER_PATH not found: {MASTER_TRACKER_PATH}")
 
     with FILE_LOCK:
+        wb = load_workbook(MASTER_TRACKER_PATH)
+        if MASTER_SHEET_NAME not in wb.sheetnames:
+            raise KeyError(f"Sheet '{MASTER_SHEET_NAME}' not found in {MASTER_TRACKER_PATH}")
+        ws = wb[MASTER_SHEET_NAME]
+        header_row = _find_xlsx_header_row(ws)
+
+        # Build header -> col index map from the sheet
+        header_cells = list(ws[header_row])
+        header_map = {}
+        for idx, cell in enumerate(header_cells, start=1):
+            name = str(cell.value).strip() if cell.value is not None else ""
+            if name:
+                header_map[name] = idx
+
+        # Find next append row
+        last = ws.max_row
+        # ensure we append after the last non-empty WO row
+        wo_idx = header_map.get("Work Order Number")
+        if wo_idx:
+            for r in range(ws.max_row, header_row, -1):
+                v = ws.cell(row=r, column=wo_idx).value
+                if v is not None and str(v).strip() != "":
+                    last = r
+                    break
+            append_row = last + 1
+        else:
+            append_row = ws.max_row + 1
+
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        appended = 0
+        for row in rows:
+            # Auto-fill Data Entry timestamp if missing
+            if not str(row.get("Time and Date of Data Entry Input", "")).strip():
+                row["Time and Date of Data Entry Input"] = now_str
+
+            # If end date missing, default to start date
+            if not str(row.get("Shift End Date", "")).strip():
+                row["Shift End Date"] = row.get("Shift Start Date", "")
+
+            # Write each known column
+            for col_name, col_idx in header_map.items():
+                if col_name not in row:
+                    continue
+                ws.cell(row=append_row, column=col_idx).value = row.get(col_name, "")
+
+            append_row += 1
+            appended += 1
+
+        wb.save(MASTER_TRACKER_PATH)
+
+    return appended
+
+
+
+# =========================================================
+# Intersection reference (Centreline Intersection - 4326.csv)
+# =========================================================
+_REF_CACHE = {
+    "fp": None,
+    "street_to_cross": {},
+    "pair_to_id": {},
+}
+
+
+def get_intersection_reference():
+    """Load and cache the intersection reference file.
+
+    Returns:
+        (street_to_cross: dict[str, list[str]], pair_to_id: dict[tuple[str,str], int])
+
+    All street names are normalized with normalize_street_name.
+    """
+    global _REF_CACHE
+
+    if not os.path.exists(INTERSECTION_REF_PATH):
+        return {}, {}
+
+    fp = file_fingerprint(INTERSECTION_REF_PATH)
+    if _REF_CACHE.get("fp") == fp and _REF_CACHE.get("street_to_cross") and _REF_CACHE.get("pair_to_id"):
+        return _REF_CACHE["street_to_cross"], _REF_CACHE["pair_to_id"]
+
+    try:
+        df = pd.read_csv(INTERSECTION_REF_PATH, encoding="latin-1")
+    except Exception:
+        df = pd.read_csv(INTERSECTION_REF_PATH, encoding="utf-8")
+
+    street_to_cross = {}
+    pair_to_id = {}
+
+    # Expect: INTERSECTION_ID, INTERSECTION_DESC, geometry
+    for _, r in df.iterrows():
+        iid = r.get("INTERSECTION_ID")
+        desc = r.get("INTERSECTION_DESC")
+        if pd.isna(iid) or not isinstance(desc, str) or "/" not in desc:
+            continue
         try:
-            df = pd.read_csv(MASTER_TRACKER_PATH, encoding="latin-1")
+            iid_int = int(iid)
         except Exception:
-            # fallback
-            df = pd.read_csv(MASTER_TRACKER_PATH, encoding="utf-8")
+            continue
 
-        changed = False
-        for c in MASTER_COLUMNS:
-            if c not in df.columns:
-                df[c] = ""
-                changed = True
+        parts = [p.strip() for p in desc.split("/") if str(p).strip()]
+        if len(parts) < 2:
+            continue
 
-        # Keep __submission_id if present; if missing, create it
-        if "__submission_id" not in df.columns:
-            df["__submission_id"] = ""
-            changed = True
+        # Normalize all parts
+        parts_norm = []
+        for part in parts:
+            norm = normalize_street_name(part)
+            if norm:
+                parts_norm.append(norm)
+        
+        if len(parts_norm) < 2:
+            continue
 
-        if changed:
-            df.to_csv(MASTER_TRACKER_PATH, index=False, encoding="latin-1")
-            log("MASTER: patched master tracker to include required columns.")
+        # For 3+ way intersections, create ALL pairwise combinations
+        # This ensures that "ST CLAIR AVE E / YONGE ST / ST CLAIR AVE W" creates:
+        # - (ST CLAIR AVENUE E, YONGE STREET)
+        # - (ST CLAIR AVENUE E, ST CLAIR AVENUE W)
+        # - (YONGE STREET, ST CLAIR AVENUE W) ← This was missing before!
+        for i in range(len(parts_norm)):
+            for j in range(i + 1, len(parts_norm)):
+                a_norm = parts_norm[i]
+                b_norm = parts_norm[j]
+                
+                # Store original forms for display
+                street_to_cross.setdefault(a_norm, set()).add(parts[j])
+                street_to_cross.setdefault(b_norm, set()).add(parts[i])
+                
+                # pair_to_id uses normalized names for lookup
+                if (a_norm, b_norm) not in pair_to_id:
+                    pair_to_id[(a_norm, b_norm)] = iid_int
+                if (b_norm, a_norm) not in pair_to_id:
+                    pair_to_id[(b_norm, a_norm)] = iid_int
 
+    # Sort lists
+    street_to_cross_sorted = {
+        k: sorted(list(v), key=lambda x: x.casefold())
+        for k, v in street_to_cross.items()
+    }
+
+    _REF_CACHE = {
+        "fp": fp,
+        "street_to_cross": street_to_cross_sorted,
+        "pair_to_id": pair_to_id,
+    }
+
+    return street_to_cross_sorted, pair_to_id
+
+# =========================================================
+# 2B. STREET -> ENDPOINT INTERSECTIONS (FROM XLSX)
+# =========================================================
+
+_STREET_ENDPOINTS_CACHE = {"fp": None, "street_endpoints": {}}
+
+
+def get_street_endpoints_index():
+    """
+    Build a Street -> [IntersectionName...] mapping from the Snow Removal Master Tracker.xlsx.
+
+    Source sheet: StreetEndPoints (columns: linear_name_full, intersection_name)
+
+    Keys are normalized to UPPER via normalize_street_name so the browser can do
+    fast lookups without API calls.
+    """
+    global _STREET_ENDPOINTS_CACHE
+
+    if not os.path.exists(MASTER_TRACKER_PATH):
+        return {}
+
+    fp = file_fingerprint(MASTER_TRACKER_PATH)
+    if _STREET_ENDPOINTS_CACHE.get("fp") == fp and _STREET_ENDPOINTS_CACHE.get("street_endpoints"):
+        return _STREET_ENDPOINTS_CACHE["street_endpoints"]
+
+    try:
+        df = pd.read_excel(MASTER_TRACKER_PATH, sheet_name="StreetEndPoints", dtype=str)
+    except Exception:
+        # If the sheet is missing, fall back to the intersection CSV (less ideal for dropdown labels)
+        street_to_cross, _ = get_intersection_reference()
+        out = {k: v[:] for k, v in (street_to_cross or {}).items()}
+        _STREET_ENDPOINTS_CACHE = {"fp": fp, "street_endpoints": out}
+        return out
+
+    out = {}
+    for _, r in df.iterrows():
+        st = normalize_street_name(r.get("linear_name_full", ""))
+        inter = str(r.get("intersection_name", "") or "").strip()
+        if not st or not inter or inter.lower() == "nan":
+            continue
+        out.setdefault(st, set()).add(inter)
+
+    out = {k: sorted(list(v), key=lambda x: x.casefold()) for k, v in out.items()}
+
+    _STREET_ENDPOINTS_CACHE = {"fp": fp, "street_endpoints": out}
+    return out
 
 
 
@@ -524,60 +992,115 @@ def normalize_blank(s):
         return ""
     return str(s).strip()
 
+def normalize_wo_id(v) -> str:
+    """
+    WO display normalization:
+    - NaN/None -> ''
+    - 909090.0 -> '909090'
+    - keeps alphanumeric IDs intact
+    """
+    try:
+        import pandas as pd
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
 
-def validate_submission(values: dict, allowed_sets: dict, streets_set: set):
+    if v is None:
+        return ""
+
+    # If it's a numeric WO coming in as float, drop .0
+    try:
+        fv = float(v)
+        if fv == int(fv):
+            return str(int(fv))
+    except Exception:
+        pass
+
+    s = str(v).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+
+def extract_cross_from_endpoint(street_val, endpoint_val):
+    """Backwards-compatible helper that returns a *single* cross-street token.
+
+    For values like 'A / B / C', this returns the first candidate from
+    endpoint_cross_candidates(). For routing, prefer endpoint_cross_candidates()
+    so we can try multiple candidates.
+    """
+    cands = endpoint_cross_candidates(street_val, endpoint_val)
+    return cands[0] if cands else ''
+
+
+def validate_submission(values: dict, allowed_sets: dict, streets_set: set, street_endpoints: dict):
+    """Validate a single WO row for intake.
+
+    New address format:
+      Street + From Intersection + To Intersection
+
+    Note: From/To values may come in as either:
+      - pure cross street (e.g., 'BOAKE ST')
+      - combined label (e.g., 'ASSINIBOINE RD / BOAKE ST')
+
+    We validate Street against streets_set, and validate From/To against the
+    StreetEndPoints list for that Street (when available).
+    """
     errors = []
 
     required = [
-        "WO", "District\n", "Ward\n", "Date\n", "Shift\n", "Supervisor\n",
-        "Location", "Type (Road Class/ School, Bridge)\n"
+        "Work Order Number",
+        "District (Where Snow Removed)",
+        "Ward (Where Snow Removed)",
+        "Shift Start Date",
+        "Shift Start Time",
+        "Shift End Time",
+        "Supervisor 1",
+        "Street",
     ]
     for k in required:
         if not normalize_blank(values.get(k)):
             errors.append(f"Missing required field: {k}")
 
-    fromv = normalize_blank(values.get("From "))
-    tov = normalize_blank(values.get("To"))
-    loc = normalize_blank(values.get("Location"))
+    street_raw = normalize_blank(values.get("Street"))
+    from_raw = normalize_blank(values.get("From Intersection"))
+    to_raw = normalize_blank(values.get("To Intersection"))
 
-    if "ENTIRE STREET" not in loc.upper():
-        if (not fromv) and (not tov):
-            errors.append("Provide at least one of From or To (unless Location contains 'ENTIRE STREET').")
+    if street_raw and "ENTIRE STREET" not in street_raw.upper():
+        if (not from_raw) and (not to_raw):
+            errors.append("Provide at least one of From Intersection or To Intersection (unless Street contains 'ENTIRE STREET').")
 
     def check_allowed(field, label, allow_custom=False):
         val = normalize_blank(values.get(field))
         if not val:
             return
-
-        # If allow_custom, do NOT restrict to allowed values
         if allow_custom:
             return
-
         allowed = allowed_sets.get(field) or []
         allowed_set = set(str(x).strip() for x in allowed if str(x).strip())
         if allowed_set and val not in allowed_set:
             errors.append(f"{label} not allowed: '{val}'")
 
-    check_allowed("District\n", "District")
-    check_allowed("Ward\n", "Ward")
-    check_allowed("Supervisor\n", "Supervisor", allow_custom=True)
+    check_allowed("District (Where Snow Removed)", "District")
+    check_allowed("Ward (Where Snow Removed)", "Ward")
+    check_allowed("Supervisor 1", "Supervisor", allow_custom=True)
 
-    # Shift is now a standardized time range, not a fixed dropdown list
-    shift_norm = normalize_shift_time_range(values.get("Shift\n", ""))
-    if normalize_blank(values.get("Shift\n", "")) and not shift_norm:
-        errors.append("Shift must be a valid time range (e.g., 06:30AM - 06:30PM).")
-    else:
-        # store normalized for later (routes will set it too; this is just validation)
-        pass
+    # Shift time range validation
+    shift_norm = normalize_shift_time_range(
+        "",
+        values.get("Shift Start Time", ""),
+        values.get("Shift End Time", ""),
+    )
+    if normalize_blank(values.get("Shift Start Time")) and normalize_blank(values.get("Shift End Time")) and not shift_norm:
+        errors.append("Shift times must form a valid range (e.g., 06:30AM - 06:30PM).")
 
-    check_allowed("Type (Road Class/ School, Bridge)\n", "Type")
-
-
-    def norm_street_for_check(s: str) -> str:
+    def norm_key(s: str) -> str:
         return re.sub(r"\s+", " ", str(s).upper().strip())
 
     def is_special_street(s: str) -> bool:
-        u = norm_street_for_check(s)
+        u = norm_key(s)
         if not u or u in ("-", ""):
             return True
         if "ENTIRE STREET" in u:
@@ -603,15 +1126,80 @@ def validate_submission(values: dict, allowed_sets: dict, streets_set: set):
                     return True
         return False
 
-    for field in ["Location", "From ", "To"]:
-        raw = normalize_blank(values.get(field))
-        if not raw or is_special_street(raw):
-            continue
-        u = norm_street_for_check(raw)
+    # 1) Validate Street only
+    if street_raw and not is_special_street(street_raw):
+        u = norm_key(street_raw)
         if not fuzzy_in_set(u, streets_set):
-            errors.append(f"{field} does not look like a valid street in centreline: '{raw}'")
+            errors.append(f"Street does not look like a valid street name: '{street_raw}'")
+
+    # 2) Validate From/To as intersections for the chosen Street (when we have endpoints)
+    street_norm = normalize_street_name(street_raw)
+    endpoints = (street_endpoints or {}).get(street_norm, []) or []
+
+    # Build normalized lookup for endpoints + cross-only options
+    endpoints_norm = {norm_key(e): e for e in endpoints}
+    cross_norms = set()
+    for e in endpoints:
+        if not e:
+            continue
+        if '/' in str(e):
+            a, b = [x.strip() for x in str(e).split('/', 1)]
+            a_n = normalize_street_name(a)
+            b_n = normalize_street_name(b)
+            if a_n == street_norm and b:
+                cross_norms.add(norm_key(b))
+            elif b_n == street_norm and a:
+                cross_norms.add(norm_key(a))
+            else:
+                # If the endpoint label doesn't match the Street cleanly, still add both sides
+                if a:
+                    cross_norms.add(norm_key(a))
+                if b:
+                    cross_norms.add(norm_key(b))
+        else:
+            # sometimes stored as pure cross
+            cross_norms.add(norm_key(e))
+
+    def validate_intersection(field_label: str, raw_val: str):
+        if not raw_val or is_special_street(raw_val) or "ENTIRE STREET" in (street_raw or "").upper():
+            return
+        if not endpoints:
+            # If we don't have endpoints for this Street, don't block submission
+            return
+
+        u = norm_key(raw_val)
+        if u in endpoints_norm:
+            return
+
+        # If user typed combined "Street / Cross", accept if cross-only matches
+        if '/' in raw_val:
+            cross_only = extract_cross_from_endpoint(street_raw, raw_val)
+            if cross_only and norm_key(cross_only) in cross_norms:
+                return
+
+        # If user typed just the cross, accept if in cross list
+        if u in cross_norms:
+            return
+
+        # Last: fuzzy match to a nearby cross option
+        best = 0.0
+        for c in list(cross_norms)[:8000]:
+            sc = difflib.SequenceMatcher(None, u, c).ratio()
+            if sc > best:
+                best = sc
+                if best >= 0.90:
+                    return
+
+        # If invalid, give a helpful message
+        ex = endpoints[:3]
+        hint = f" Examples: {', '.join([repr(x) for x in ex])}" if ex else ""
+        errors.append(f"{field_label} is not a valid intersection for Street '{street_raw}': '{raw_val}'.{hint}")
+
+    validate_intersection("From Intersection", from_raw)
+    validate_intersection("To Intersection", to_raw)
 
     return errors
+
 
 
 def compute_batch_id(rows: list) -> str:
@@ -844,54 +1432,44 @@ def get_intake_submission_details(submission_id: str) -> dict:
 
 def apply_intake_to_master():
 
-    """
-    Applies any new intake submissions to MASTER_TRACKER_PATH.
+    """Apply eligible intake submissions into the Excel master tracker.
+
+    Eligibility:
+    - __status == PENDING
+    - pending grace period has elapsed (based on __pending_until_epoch or __submitted_at)
+    - not already present in master (duplicate-safe)
 
     Returns:
         (applied_count: int, applied_items: list[dict])
     """
     global LAST_MASTER_WRITE_BY_INTAKE_AT, LAST_MASTER_FP_WRITTEN_BY_INTAKE
 
-
     ensure_intake_file()
-    ensure_master_has_columns()
+
     if not os.path.exists(MASTER_TRACKER_PATH):
         log("INTAKE APPLY: master tracker missing; cannot apply.")
         return 0, []
 
     with FILE_LOCK:
-        log("INTAKE APPLY: loading intake + master...")
+        log("INTAKE APPLY: loading intake + master (xlsx)...")
         try:
             intake = pd.read_csv(INTAKE_PATH, encoding="utf-8")
         except Exception:
             intake = pd.read_csv(INTAKE_PATH, encoding="latin-1")
-
-        master = pd.read_csv(MASTER_TRACKER_PATH, encoding="latin-1")
-
-        if "__submission_id" not in master.columns:
-            master["__submission_id"] = ""
 
         # Ensure intake status columns exist
         if "__status" not in intake.columns:
             intake["__status"] = "PENDING"
         if "__batch_id" not in intake.columns:
             intake["__batch_id"] = ""
+        if "__pending_until_epoch" not in intake.columns:
+            intake["__pending_until_epoch"] = ""
 
         intake["__status"] = intake["__status"].fillna("").astype(str)
 
-        intake_ids = set(intake.get("__submission_id", pd.Series([], dtype=str)).astype(str))
-        master_ids = set(master.get("__submission_id", pd.Series([], dtype=str)).astype(str))
-
-        # Only apply rows that are:
-        # - status == PENDING
-        # - not already in master
-        # - AND have been pending for at least PENDING_GRACE_SECONDS
-
         pending = intake[intake["__status"].astype(str).str.upper().eq("PENDING")].copy()
 
-        # Use __pending_until_epoch if available; fallback to __submitted_at + grace
         now_epoch = time.time()
-
         pending_until = pd.to_numeric(pending.get("__pending_until_epoch", ""), errors="coerce")
 
         ts = pd.to_datetime(pending.get("__submitted_at", ""), errors="coerce")
@@ -902,93 +1480,131 @@ def apply_intake_to_master():
         pending_until = pending_until.fillna(fallback_until)
 
         eligible = pending[pending_until <= float(now_epoch)].copy()
-
-        new_rows = eligible[~eligible["__submission_id"].astype(str).isin(master_ids)].copy()
-
-
-        if new_rows.empty:
-            log("INTAKE APPLY: no new submissions to apply.")
+        if eligible.empty:
+            log("INTAKE APPLY: no eligible submissions to apply yet.")
             return 0, []
 
+        # Build duplicate guard from current master
+        try:
+            master_df = read_master_xlsx()
+        except Exception as e:
+            log(f"INTAKE APPLY: failed to read master xlsx: {e}")
+            return 0, []
 
-        to_append = []
-        master_cols = list(master.columns)
+        existing_sids = set()
+        try:
+            for _, mr in master_df.iterrows():
+                d = {c: (mr.get(c, "") if c in master_df.columns else "") for c in MASTER_COLUMNS}
+                existing_sids.add(compute_submission_id(d))
+        except Exception:
+            existing_sids = set()
+
+        new_rows = []
         applied_items = []
 
-        for _, r in new_rows.iterrows():
-            row = {c: "" for c in master_cols}
-            for col in MASTER_COLUMNS:
-                if col in row:
-                    row[col] = r.get(col, "")
-            row["__submission_id"] = r.get("__submission_id", "")
-            to_append.append(row)
+        for _, r in eligible.iterrows():
+            row = {c: r.get(c, "") for c in MASTER_COLUMNS}
+
+            # Normalize key fields
+            row["Work Order Number"] = normalize_wo_id(row.get("Work Order Number", ""))
+
+            # Shift end date defaults to shift start date
+            if not str(row.get("Shift End Date", "")).strip():
+                row["Shift End Date"] = row.get("Shift Start Date", "")
+
+            sid = compute_submission_id(row)
+            if sid in existing_sids:
+                continue
+
+            existing_sids.add(sid)
+            new_rows.append(row)
 
             applied_items.append({
                 "__submission_id": str(r.get("__submission_id", "")).strip(),
                 "__submitted_at": str(r.get("__submitted_at", "")).strip(),
-                "WO": str(r.get("WO", "")).strip(),
-                "District": str(r.get("District\n", "")).strip(),
-                "Ward": str(r.get("Ward\n", "")).strip(),
-                "Date": str(r.get("Date\n", "")).strip(),
-                "Shift": str(r.get("Shift\n", "")).strip(),
-                "Supervisor": str(r.get("Supervisor\n", "")).strip(),
-                "Type": str(r.get("Type (Road Class/ School, Bridge)\n", "")).strip(),
-                "Location": str(r.get("Location", "")).strip(),
-                "From": str(r.get("From ", "")).strip(),
-                "To": str(r.get("To", "")).strip(),
+                "Work Order Number": str(row.get("Work Order Number", "")).strip(),
+                "District": str(row.get("District (Where Snow Removed)", "")).strip(),
+                "Ward": str(row.get("Ward (Where Snow Removed)", "")).strip(),
+                "Street": str(row.get("Street", "")).strip(),
+                "From Intersection": str(row.get("From Intersection", "")).strip(),
+                "To Intersection": str(row.get("To Intersection", "")).strip(),
             })
 
-        before = len(master)
-        master = pd.concat([master, pd.DataFrame(to_append)], ignore_index=True)
-        master.to_csv(MASTER_TRACKER_PATH, index=False, encoding="latin-1")
+        if not new_rows:
+            log("INTAKE APPLY: no new submissions to apply (all duplicates or not eligible).")
+            return 0, []
+
+        # Append to Excel master
+        try:
+            appended = append_rows_to_master_xlsx(new_rows)
+        except Exception as e:
+            log(f"INTAKE APPLY: failed to append to master xlsx: {e}")
+            return 0, []
 
         # Mark applied rows as APPLIED in intake (so they won't re-apply)
         try:
-            applied_ids = set(new_rows["__submission_id"].astype(str).tolist())
-            mask = intake["__submission_id"].astype(str).isin(applied_ids)
-            intake.loc[mask, "__status"] = "APPLIED"
-            intake.to_csv(INTAKE_PATH, index=False, encoding="utf-8")
+            applied_ids = set(str(x.get("__submission_id", "")).strip() for x in applied_items if x.get("__submission_id"))
+            if applied_ids:
+                mask = intake["__submission_id"].astype(str).isin(applied_ids)
+                intake.loc[mask, "__status"] = "APPLIED"
+                intake.to_csv(INTAKE_PATH, index=False, encoding="utf-8")
         except Exception as e:
             log(f"INTAKE APPLY: could not mark APPLIED in intake: {e}")
-
 
         with LAST_MASTER_WRITE_LOCK:
             LAST_MASTER_WRITE_BY_INTAKE_AT = time.time()
             LAST_MASTER_FP_WRITTEN_BY_INTAKE = file_fingerprint(MASTER_TRACKER_PATH)
 
+        log(f"INTAKE APPLY: applied {appended} new row(s) into Excel master tracker.")
+        return appended, applied_items
 
-        after = len(master)
-        applied = after - before
-        log(f"INTAKE APPLY: applied {applied} new row(s) into MASTER_TRACKER.")
-        return applied, applied_items
 
 def build_workorder_popup(props: dict) -> str:
     wo = props.get("WO", "")
-    total_segments = props.get("Total_Segments", "")
-
-    loc = props.get("Location", "")
-    to_ = props.get("To", "")
+    street = props.get("Street", "")
     frm = props.get("From", "")
-
-    wo_m_disp = props.get("WO_m_display", "")
-    wo_km_disp = props.get("WO_km_display", "")
+    to_ = props.get("To", "")
 
     route_mode = props.get("route_mode", "")
     supervisor = props.get("Supervisor", "")
     district = props.get("District", "")
     ward = props.get("Ward", "")
-    date = props.get("Date", "")
+    date = props.get("ShiftStartDate", "")
     shift = props.get("Shift", "")
-    work_type = props.get("Type", "")
 
-    dump_trucks = props.get("DumpTrucks", "")
-    dump_provider = props.get("DumpTruckProvider", "")
-    loads = props.get("Loads", "")
-    tonnes = props.get("Tonnes", "")
+    # All operational fields
+    toa = props.get("TOA", "")
     side = props.get("Side", "")
     road_side = props.get("RoadSide", "")
-    snow_dump_site = props.get("SnowDumpSite", "")
-    comments = props.get("Comments", "")
+    
+    roadway = props.get("Roadway", "")
+    sidewalk = props.get("Sidewalk", "")
+    cycling = props.get("SeparatedCycling", "")
+    bridge = props.get("Bridge", "")
+    school = props.get("SchoolZones", "")
+    
+    equipment = props.get("EquipmentMethod", "")
+    dump_trucks = props.get("DumpTrucks", "")
+    dump_source = props.get("DumpTruckSource", "")
+    contractor_toa = props.get("ContractorTOA", "")
+    loads = props.get("Loads", "")
+    tonnes = props.get("Tonnes", "")
+    snow_site = props.get("SnowDumpSite", "")
+    
+    crew_type = props.get("CrewType", "")
+    num_crews = props.get("NumCrews", "")
+    crew_num = props.get("CrewNumber", "")
+    inhouse = props.get("InHouseBase", "")
+    num_staff = props.get("NumStaff", "")
+    
+    notes = props.get("Notes", "")
+
+    # Helper: only show rows with data
+    def row(label, val):
+        v = str(val or "").strip()
+        if not v or v.lower() in ("nan", "none", ""):
+            return ""
+        return f"<b>{html.escape(label)}:</b> {html.escape(v)}<br>"
 
     extra = ""
     if route_mode:
@@ -999,34 +1615,53 @@ def build_workorder_popup(props: dict) -> str:
         )
 
     return f"""
-    <div style="font-family:Arial;font-size:13px;line-height:1.25;">
-      <b>WO:</b> {html.escape(str(wo))}<br>
-      <b>Total Segments:</b> {html.escape(str(total_segments))}<br>
-      <b>Location:</b> {html.escape(str(loc))}<br>
-      <b>To:</b> {html.escape(str(to_))}<br>
+    <div style='font-family:Arial;font-size:13px;line-height:1.25;max-width:420px;'>
+      <div style='font-size:15px;font-weight:800;margin-bottom:8px;'>Work Order {html.escape(str(wo))}</div>
+      
+      <b>Street:</b> {html.escape(str(street))}<br>
       <b>From:</b> {html.escape(str(frm))}<br>
-      <b>Distance (m):</b> {html.escape(str(wo_m_disp))}<br>
-      <b>Distance (km):</b> {html.escape(str(wo_km_disp))}<br>
+      <b>To:</b> {html.escape(str(to_))}<br>
       {extra}
-      <hr style="margin:6px 0;">
+      
+      <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+      
       <b>Supervisor:</b> {html.escape(str(supervisor))}<br>
       <b>District:</b> {html.escape(str(district))}<br>
       <b>Ward:</b> {html.escape(str(ward))}<br>
+      {row('TOA Area', toa)}
       <b>Date:</b> {html.escape(str(date))}<br>
       <b>Shift:</b> {html.escape(str(shift))}<br>
-      <b>Type:</b> {html.escape(str(work_type))}<br>
-      <hr style="margin:6px 0;">
-      <b>Dump Trucks:</b> {html.escape(str(dump_trucks))}<br>
-      <b>Dump Truck Provider:</b> {html.escape(str(dump_provider))}<br>
-      <b>Loads:</b> {html.escape(str(loads))}<br>
-      <b>Tonnes:</b> {html.escape(str(tonnes))}<br>
-      <b>Side:</b> {html.escape(str(side))}<br>
-      <b>Road Side:</b> {html.escape(str(road_side))}<br>
-      <b>Snow Dump Site:</b> {html.escape(str(snow_dump_site))}<br>
-      <b>Comments:</b> {html.escape(str(comments))}<br>
+      
+      <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+      
+      {row('Side Cleared', side)}
+      {row('Road Side', road_side)}
+      {row('Roadway', roadway)}
+      {row('Sidewalk', sidewalk)}
+      {row('Cycling Infra', cycling)}
+      {row('Bridge', bridge)}
+      {row('School Zones', school)}
+      
+      <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+      
+      {row('Equipment', equipment)}
+      {row('Dump Trucks', dump_trucks)}
+      {row('Source', dump_source)}
+      {row('Contractor TOA', contractor_toa)}
+      {row('Loads', loads)}
+      {row('Tonnes', tonnes)}
+      {row('Snow Site', snow_site)}
+      
+      {row('Crew Type', crew_type)}
+      {row('# Crews', num_crews)}
+      {row('Crew #', crew_num)}
+      {row('In-House Base', inhouse)}
+      {row('# Staff', num_staff)}
+      
+      <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+      {row('Notes', notes)}
     </div>
     """
-
 # =========================================================
 # 4. BUILD EVERYTHING (MAP BUILD)
 # =========================================================
@@ -1053,46 +1688,7 @@ def build_everything():
 
         intake_debug_rows = []
 
-        def normalize_street_name(name: str) -> str:
-            if not isinstance(name, str):
-                return ""
-            n = name.upper().strip()
-
-            n = re.sub(r"^(EB|WB|NB|SB)\s*[/\-]?\s+", "", n)
-            n = re.sub(r"\s*-\s*(SB|NB|EB|WB)\s*$", "", n)
-            n = re.sub(r"\s+(SB|NB|EB|WB)\s*$", "", n)
-
-            n = n.replace("-", " ")
-            n = re.sub(r"\s+", " ", n)
-            n = re.sub(r"\bDVP\b", "DON VALLEY PARKWAY", n)
-
-            replacements = {
-                " RD": " ROAD",
-                " ST": " STREET",
-                " AVE": " AVENUE",
-                " BLVD": " BOULEVARD",
-                " HWY": " HIGHWAY",
-                " PKWY": " PARKWAY",
-                " DR": " DRIVE",
-                " CRES": " CRESCENT",
-                " CR": " CRESCENT",
-                " LN": " LANE",
-                " SQ": " SQUARE",
-                " CIR": " CIRCLE",
-                " PL": " PLACE",
-            }
-            for short, full in replacements.items():
-                n = re.sub(rf"{short}($|\s)", f"{full} ", n)
-
-            n = re.sub(r"\s+", " ", n).strip()
-
-            dir_map = {"N": "NORTH", "S": "SOUTH", "E": "EAST", "W": "WEST"}
-            parts = n.split()
-            if parts and parts[-1] in dir_map:
-                parts[-1] = dir_map[parts[-1]]
-                n = " ".join(parts)
-
-            return n.strip()
+    
 
         # --- Direction-aware matching helpers ---
         def dir_tag(s: str) -> str:
@@ -1163,6 +1759,11 @@ def build_everything():
                 return matches[-1].group(1).strip()
 
             return t
+        def extract_cross_from_endpoint(street_val, endpoint_val):
+            cands = endpoint_cross_candidates(street_val, endpoint_val)
+            return cands[0] if cands else ''
+
+
 
         def compute_multiline_length(multiline):
             total = 0.0
@@ -1325,7 +1926,7 @@ def build_everything():
         if not os.path.exists(CENTRELINE_PATH):
             raise FileNotFoundError(f"CENTRELINE_PATH not found: {CENTRELINE_PATH}")
 
-        master = pd.read_csv(MASTER_TRACKER_PATH, encoding="latin-1")
+        master = read_master_xlsx()
         centre = pd.read_csv(CENTRELINE_PATH, encoding="latin-1")
 
         log(f"Centreline rows: {len(centre)}")
@@ -1421,23 +2022,36 @@ def build_everything():
         )
 
         # ---------------------------------------------------------
-        # UI helper: Location → Cross-streets lookup (for /new form)
+        # UI helper: Street → Cross-streets (for /new and /edit forms)
         # ---------------------------------------------------------
-        # For each centreline street key, precompute the set of other streets that
-        # intersect it at any node. This powers the "To/From" dependent picklists.
-        street_to_cross = {}
-        for _s, _nodes in street_nodes.items():
-            try:
-                _cross = set()
-                for _nid in _nodes:
-                    _cross.update(intersection_to_streets.get(int(_nid), set()))
-                _cross.discard(_s)
-                street_to_cross[_s] = sorted(
-                    [x for x in _cross if x and isinstance(x, str)],
-                    key=lambda x: x.casefold()
-                )
-            except Exception:
-                street_to_cross[_s] = []
+        # The webforms now use the new address format:
+        #   Street + Street/From Intersection + Street/To Intersection
+        # We source the dependent cross-street picklists from the Centreline
+        # Intersection reference file. Routing still uses the full centreline graph.
+
+        ref_street_to_cross, ref_pair_to_id = get_intersection_reference()
+
+        if ref_street_to_cross:
+            street_to_cross = ref_street_to_cross
+        else:
+            # Fallback to graph-derived cross streets (older behavior)
+            street_to_cross = {}
+            for _s, _nodes in street_nodes.items():
+                try:
+                    _cross = set()
+                    for _nid in _nodes:
+                        _cross.update(intersection_to_streets.get(int(_nid), set()))
+                    _cross.discard(_s)
+                    street_to_cross[_s] = sorted(
+                        [x for x in _cross if x and isinstance(x, str)],
+                        key=lambda x: x.casefold()
+                    )
+                except Exception:
+                    street_to_cross[_s] = []
+
+        # Prefer the reference street list for UI if available; otherwise use centreline
+        if ref_street_to_cross:
+            ALL_CENTRE_STREETS = sorted([s for s in ref_street_to_cross.keys() if s], key=lambda x: x.casefold())
 
 
         TYPE_TOKENS = {
@@ -1551,6 +2165,32 @@ def build_everything():
             if not inter:
                 return None
             return min(inter)
+
+        def lookup_intersection_id_from_reference(street1_key, street2_key, pair_to_id_dict):
+            """
+            Look up the intersection ID from the reference file for two streets.
+            
+            Args:
+                street1_key: Normalized street name 1
+                street2_key: Normalized street name 2
+                pair_to_id_dict: The pair_to_id dictionary from get_intersection_reference()
+                
+            Returns:
+                intersection_id (int) or None
+            """
+            if not pair_to_id_dict:
+                return None
+            
+            # Try both orderings
+            iid = pair_to_id_dict.get((street1_key, street2_key))
+            if iid is not None:
+                return iid
+            
+            iid = pair_to_id_dict.get((street2_key, street1_key))
+            if iid is not None:
+                return iid
+            
+            return None
 
         def shortest_path_for_street(street_key, start_node, end_node, max_hops=5000):
             g = street_graphs.get(street_key)
@@ -1751,7 +2391,7 @@ def build_everything():
             <div style="font-family:Arial;font-size:13px;">
               <b>Intersection Point</b><br>
               <b>WO:</b> {html.escape(str(wo_id))}<br>
-              <b>Location:</b> {html.escape(str(loc_raw))}<br>
+              <b>Street:</b> {html.escape(str(loc_raw))}<br>
               <b>From:</b> {html.escape(str(from_raw))}<br>
               <b>To:</b> {html.escape(str(to_raw))}<br>
               <b>Intersection ID:</b> {html.escape(str(intersection_id))}<br>
@@ -1777,7 +2417,7 @@ def build_everything():
             <div style="font-family:Arial;font-size:13px;line-height:1.25;">
               <b>WO:</b> {html.escape(str(props.get("WO_ID","")))}<br>
               <b>Total Segments:</b> {html.escape(str(props.get("Segment_count","")))}<br>
-              <b>Location:</b> {html.escape(str(props.get("Location","")))}<br>
+              <b>Street:</b> {html.escape(str(props.get("Location","")))}<br>
               <b>To:</b> {html.escape(str(props.get("To","")))}<br>
               <b>From:</b> {html.escape(str(props.get("From","")))}<br>
               <b>Distance (m):</b> {html.escape(str(wo_m_str))}<br>
@@ -1995,7 +2635,7 @@ def build_everything():
                   div.className = 'item';
                   div.innerHTML =
                     '<div><b>WO:</b> ' + escapeHtml(wo) + (sid ? (' &nbsp; <span style="color:#666;">(' + escapeHtml(sid) + ')</span>') : '') + '</div>' +
-                    '<div style="margin-top:4px;"><b>Location:</b> ' + escapeHtml(loc) + '</div>' +
+                    '<div style="margin-top:4px;"><b>Street:</b> ' + escapeHtml(loc) + '</div>' +
                     '<div><b>From:</b> ' + escapeHtml(fr) + '</div>' +
                     '<div><b>To:</b> ' + escapeHtml(to) + '</div>' +
                     '<div style="margin-top:4px;color:#333;"><b>District:</b> ' + escapeHtml(dist) +
@@ -2491,7 +3131,7 @@ def build_everything():
                     "Location": str(loc_raw),
                     "From": str(from_raw),
                     "To": str(to_raw),
-                    "Location_resolved": str(street_key),
+                    "Street_resolved": str(street_key),
                     "District": str(district_val),
                     "Ward": str(ward),
                     "Date": str(date_str),
@@ -2601,58 +3241,70 @@ def build_everything():
                 "Location": loc_raw,
                 "From": from_raw,
                 "To": to_raw,
-                "Location_resolved": loc_key,
+                "Street_resolved": loc_key,
                 "From_resolved": from_key,
                 "To_resolved": to_key,
             })
 
         def add_line_feature(row, wo_id, geometry, color, district_val, ward_val, date_val, shift_val,
-                             supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
-                             loc_key=None, from_key=None, to_key=None, route_mode=""):
+                     supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
+                     loc_key=None, from_key=None, to_key=None, route_mode=""):
 
             props = {
                 "feature_kind": "workorder_line",
                 "WO_ID": normalize_wo_id(wo_id),
+                "WO": normalize_wo_id(wo_id),
 
-                # Raw values used in geometry & routing
+                # Location
                 "Location": str(loc_raw),
+                "Street": str(loc_raw),
                 "From": str(from_raw),
                 "To": str(to_raw),
-                "Location_resolved": loc_key,
+                "FromIntersection": str(from_raw),
+                "ToIntersection": str(to_raw),
+                "Street_resolved": loc_key,
                 "From_resolved": from_key,
                 "To_resolved": to_key,
 
-                # MASTER-style fields (KEEP – existing logic depends on these)
+                # Admin
                 "District": district_val,
                 "Ward": ward_val,
-                "Date": date_val,
-                "Shift": shift_val,
                 "Supervisor": str(supervisor_raw).strip(),
                 "SupervisorKey": sup_key,
-                "Type": type_val,
-
-                # ✅ WEBFORM-style DISPLAY fields (NEW – used by popup/tooltips)
-                "WO": normalize_wo_id(wo_id),
-                "District__NL": str(district_val),
-                "Ward__NL": str(ward_val),
-                "Date__NL": str(date_val),
-                "Shift__NL": str(shift_val),
-                "Supervisor__NL": str(supervisor_raw).strip(),
-                "Type__NL": str(type_val),
-                # --- NEW: equipment fields (from the same row that created this WO) ---
+                "ShiftStartDate": date_val,
+                "Shift": shift_val,
+                
+                # Operational fields
+                "TOA": clean_text(row.get("TOA Area (Where Snow Removed)", "")),
+                "Side": clean_text(row.get("One Side / Both Sides Cleared?", "")),
+                "RoadSide": clean_text(row.get("Side of Road Cleared", "")),
+                
+                "Roadway": clean_text(row.get("Infrastructure Type: Roadway", "")),
+                "Sidewalk": clean_text(row.get("Infrastructure Type: Sidewalk", "")),
+                "SeparatedCycling": clean_text(row.get("Infrastructure Type: Separated Cycling Infrastructure", "")),
+                "Bridge": clean_text(row.get("Infrastructure Type: Bridge", "")),
+                "SchoolZones": clean_text(row.get("Infrastructure Type: School Loading Zones", "")),
+                
+                "EquipmentMethod": clean_text(row.get("Equipment Method", "")),
                 "DumpTrucks": clean_text(row.get("# of Equipment (Dump Trucks)", "")),
-                "DumpTruckProvider": clean_text(row.get("Dump Truck Provider Contractor", "")),
+                "DumpTruckSource": clean_text(row.get("Dump Truck Source (In-House/Contractor)", "")),
+                "ContractorTOA": clean_text(row.get("Contractor: Crew TOA Area Responsibility", "")),
                 "Loads": clean_text(row.get("# of Loads", "")),
                 "Tonnes": clean_text(row.get("Tonnes", "")),
-                "Side": clean_text(row.get("One Side/ Both Sides", "")),
-                "RoadSide": clean_text(row.get("Side of Road Cleared", "")),
-                "SnowDumpSite": clean_text(row.get("Snow Dumped Site", "")),
-                "Comments": clean_text(row.get("Comments", "")),
+                "SnowDumpSite": clean_text(row.get("Snow Dump Site", "")),
+                
+                "CrewType": clean_text(row.get("Snow Removal by Contracted Crew or In-House?", "")),
+                "NumCrews": clean_text(row.get("Contractor: # of Crews", "")),
+                "CrewNumber": clean_text(row.get("Contractor: Crew Number", "")),
+                "InHouseBase": clean_text(row.get("In-House: Staff Responsibility (Base Yard)", "")),
+                "NumStaff": clean_text(row.get("In-House: # of Staff", "")),
+                
+                "Notes": clean_text(row.get("NOTES", "")),
+                "Type": type_val,
 
                 "stroke_color": color,
                 "route_mode": route_mode,
             }
-
 
             feature = {"type": "Feature", "geometry": geometry, "properties": props}
             geojson_features.append(feature)
@@ -2668,28 +3320,18 @@ def build_everything():
                 name=f"WO {wo_id}",
             )
 
+            # ✅ FIXED TOOLTIP - Use actual property keys
             tooltip = folium.GeoJsonTooltip(
-                fields=["WO_ID", "Location", "From", "To", "District__NL", "Supervisor__NL", "Date__NL", "Shift__NL"],
-                aliases=["WO", "Location", "From", "To", "District__NL", "Supervisor__NL", "Date__NL", "Shift__NL"],
+                fields=["WO_ID", "Location", "From", "To", "District", "Supervisor", "ShiftStartDate", "Shift"],
+                aliases=["WO", "Street", "From", "To", "District", "Supervisor", "Date", "Shift"],
                 sticky=False,
             )
-
             tooltip.add_to(gj)
 
-            # ✅ ALWAYS define popup_html first
+            # ✅ UPDATED POPUP with all fields
             popup_html = build_workorder_popup(props)
-
-            # Optional: append routing note safely (only if route_mode exists)
-            if route_mode:
-                popup_html = popup_html.replace(
-                    "</table>",
-                    f"</table><div style='margin-top:8px;padding:6px;border-radius:6px;background:#fff3cd;border:1px solid #ffeeba;'>"
-                    f"<b>Routing:</b> {html.escape(str(route_mode))}</div>"
-                )
-
             folium.Popup(popup_html, max_width=420).add_to(gj)
             gj.add_to(work_orders_group)
-
 
         for _, row in master.iterrows():
             row_dict = row.to_dict()
@@ -2697,19 +3339,34 @@ def build_everything():
             submission_id = str(row.get("__submission_id", "")).strip()
             is_intake_row = bool(submission_id) and (submission_id in intake_ids_set)
 
-            loc_raw = row.get("Location", "")
-            from_raw = row.get("From ", "")
-            to_raw = row.get("To", "")
+            loc_raw = row.get("Street", "")
+            from_raw = row.get("From Intersection", "")
+            to_raw = row.get("To Intersection", "")
+            
+            # DEBUG: Log raw values for St Clair
+            if "CLAIR" in str(loc_raw).upper():
+                log(f"DEBUG RAW: Street='{loc_raw}', From='{from_raw}', To='{to_raw}'")
 
+            # Main street
             loc_core = extract_street_token(loc_raw)
-            from_core = extract_street_token(from_raw)
-            to_core = extract_street_token(to_raw)
-
             loc_norm = normalize_street_name(loc_core)
-            from_norm = normalize_street_name(from_core)
-            to_norm = normalize_street_name(to_core)
+
+            # ✅ From/To may be 'STREET / CROSS' OR 'A / B / C' (3-way) — collect multiple candidates
+            from_candidates_norm = endpoint_cross_candidates(loc_raw, from_raw)
+            to_candidates_norm = endpoint_cross_candidates(loc_raw, to_raw)
+
+            # Keep a single primary value for logging/debug, but use candidates for routing
+            from_norm = from_candidates_norm[0] if from_candidates_norm else ""
+            to_norm = to_candidates_norm[0] if to_candidates_norm else ""
+
 
             loc_key, loc_score = resolve_street_name(loc_norm, MIN_SIM_LOCATION)
+            
+            # DEBUG
+            if "CLAIR" in loc_norm:
+                log(f"DEBUG: loc_norm='{loc_norm}' -> loc_key='{loc_key}', score={loc_score:.3f}")
+                log(f"DEBUG: loc_key in street_graphs: {loc_key in street_graphs if loc_key else 'N/A'}")
+            
             if not loc_key:
                 reason = f"Location not matched to centreline (core='{loc_core}', norm='{loc_norm}', best_score={loc_score:.2f})"
                 row_dict["skip_reason"] = reason
@@ -2718,19 +3375,21 @@ def build_everything():
                 skip_reason_counter[reason] += 1
                 if is_intake_row:
                     intake_skipped_counter += 1
-                    log(f"INTAKE SKIP: WO={row.get('WO','')} id={submission_id} -> {reason}")
-                    record_intake_debug("SKIPPED", submission_id, row.get("WO", ""), reason, loc_raw, from_raw, to_raw)
+                    log(f"INTAKE SKIP: WO={row.get('Work Order Number','')} id={submission_id} -> {reason}")
+                    record_intake_debug("SKIPPED", submission_id, row.get("Work Order Number", ""), reason, loc_raw, from_raw, to_raw)
                 continue
 
-            wo_id = str(row.get("WO", ""))
-            district_val = str(row.get("District\n", "Unknown")).strip() or "Unknown"
+            wo_id = str(row.get("Work Order Number", ""))
+            district_val = str(row.get("District (Where Snow Removed)", "Unknown")).strip() or "Unknown"
             color = get_color_for_district(district_val)
-            ward_val = str(row.get("Ward\n", "")).strip()
-            date_val = str(row.get("Date\n", "")).strip()
-            shift_val = str(row.get("Shift\n", "")).strip()
-            type_val = str(row.get("Type (Road Class/ School, Bridge)\n", "")).strip()
+            ward_val = str(row.get("Ward (Where Snow Removed)", "")).strip()
+            date_val = str(row.get("Shift Start Date", "")).strip()
+            shift_start_t = str(row.get("Shift Start Time", "")).strip()
+            shift_end_t = str(row.get("Shift End Time", "")).strip()
+            shift_val = normalize_shift_time_range("", shift_start_t, shift_end_t) or (f"{shift_start_t} - {shift_end_t}".strip(" -"))
+            type_val = ""
 
-            supervisor_raw = row.get("Supervisor\n", "")
+            supervisor_raw = row.get("Supervisor 1", "")
             sup_key = make_supervisor_key(supervisor_raw)
 
             from_is_str = isinstance(from_raw, str)
@@ -2743,7 +3402,7 @@ def build_everything():
             if entire_flag:
                 coords_to_use = full_street_multiline(loc_key)
                 if not coords_to_use:
-                    reason = "Entire Street requested but no geometry found for Location"
+                    reason = "Entire Street requested but no geometry found for Street"
                     row_dict["skip_reason"] = reason
                     skipped_records.append(row_dict)
                     skipped_count += 1
@@ -2777,8 +3436,31 @@ def build_everything():
                     record_intake_debug("SKIPPED", submission_id, wo_id, reason, loc_raw, from_raw, to_raw, loc_key)
                 continue
 
-            from_key, from_score = resolve_street_name(from_norm, MIN_SIM_CROSS)
-            to_key, to_score = resolve_street_name(to_norm, MIN_SIM_CROSS)
+            # Resolve candidate cross-streets (may be multiple for 3-way endpoints)
+            def _resolve_candidates(norm_list):
+                out = []
+                for norm in (norm_list or []):
+                    k, sc = resolve_street_name(norm, MIN_SIM_CROSS)
+                    if k:
+                        out.append((k, float(sc), norm))
+                # Highest score first; de-dupe by key
+                out.sort(key=lambda t: t[1], reverse=True)
+                seen = set()
+                dedup = []
+                for k, sc, norm in out:
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    dedup.append((k, sc, norm))
+                return dedup
+
+            from_resolved = _resolve_candidates(from_candidates_norm or ([from_norm] if from_norm else []))
+            to_resolved   = _resolve_candidates(to_candidates_norm   or ([to_norm]   if to_norm else []))
+
+            # Primary display keys/scores (best candidate)
+            from_key, from_score = (from_resolved[0][0], from_resolved[0][1]) if from_resolved else (None, 0.0)
+            to_key, to_score     = (to_resolved[0][0],   to_resolved[0][1])   if to_resolved   else (None, 0.0)
+
 
             if not from_key or not to_key:
                 reason = f"From/To not matched (From='{from_norm}', score={from_score:.2f}; To='{to_norm}', score={to_score:.2f})"
@@ -2791,11 +3473,87 @@ def build_everything():
                     log(f"INTAKE SKIP: WO={wo_id} id={submission_id} -> {reason}")
                     record_intake_debug("SKIPPED", submission_id, wo_id, reason, loc_raw, from_raw, to_raw, loc_key, from_key or "", to_key or "")
                 continue
+            # Prefer explicit intersection IDs (if provided in the master), then fall back to name matching
 
-            start_node = find_intersection_node(loc_key, from_key)
-            end_node = find_intersection_node(loc_key, to_key)
+            g_loc = street_graphs.get(loc_key)
 
+            def _parse_int_id(v):
+                try:
+                    if v is None:
+                        return None
+                    s = str(v).strip()
+                    if not s or s.lower() == "nan":
+                        return None
+                    return int(float(s))
+                except Exception:
+                    return None
+
+            from_id = _parse_int_id(row.get("From Intersection ID", ""))
+            to_id   = _parse_int_id(row.get("To Intersection ID", ""))
+
+            # Try explicit IDs first (if present and valid for this street graph)
+            start_node = from_id if (g_loc and from_id in g_loc["adj"]) else None
+            end_node   = to_id   if (g_loc and to_id   in g_loc["adj"]) else None
+
+            # For 3-way endpoints, try multiple candidate cross-streets until we find a valid node
+            def _pick_node_from_candidates(resolved_list):
+                """Return (node_id, chosen_cross_key, chosen_score) or (None, best_key, best_score)."""
+                if not resolved_list:
+                    return (None, None, 0.0)
+
+                # Keep best for display even if we fail
+                best_key, best_sc, _best_norm = resolved_list[0]
+
+                for cross_key, sc, _norm in resolved_list:
+                    # 1) Prefer reference lookup (more authoritative)
+                    if ref_pair_to_id:
+                        try:
+                            ref_id = lookup_intersection_id_from_reference(loc_key, cross_key, ref_pair_to_id)
+                        except Exception:
+                            ref_id = None
+                        if ref_id and g_loc and ref_id in g_loc["adj"]:
+                            return (ref_id, cross_key, sc)
+
+                    # 2) Fallback: common-node method
+                    nid = find_intersection_node(loc_key, cross_key)
+                    if nid is not None:
+                        # If we have a street-local graph, ensure membership
+                        if (not g_loc) or (nid in g_loc["adj"]):
+                            return (nid, cross_key, sc)
+
+                return (None, best_key, best_sc)
+
+            # If explicit IDs missing/invalid, try candidate lists (works for 2-way + 3-way)
+            if start_node is None:
+                start_node, chosen_from_key, chosen_from_sc = _pick_node_from_candidates(from_resolved)
+                if chosen_from_key:
+                    from_key, from_score = chosen_from_key, float(chosen_from_sc)
+
+            if end_node is None:
+                end_node, chosen_to_key, chosen_to_sc = _pick_node_from_candidates(to_resolved)
+                if chosen_to_key:
+                    to_key, to_score = chosen_to_key, float(chosen_to_sc)
+
+            # DEBUG LOGGING
+            if loc_key == "ST CLAIR AVENUE W":
+                log(f"DEBUG St Clair: from_key={from_key}, to_key={to_key}")
+                log(f"DEBUG St Clair: start_node={start_node}, end_node={end_node}")
+                log(f"DEBUG St Clair: g_loc exists={g_loc is not None}")
+                if g_loc:
+                    log(f"DEBUG St Clair: g_loc['adj'] has {len(g_loc['adj'])} keys")
+            
             if start_node is None or end_node is None or start_node == end_node:
+                # More informative fallback message
+                route_info = []
+                if start_node is None:
+                    route_info.append(f"From intersection ({from_key}) not found in centreline")
+                if end_node is None:
+                    route_info.append(f"To intersection ({to_key}) not found in centreline")
+                if start_node == end_node and start_node is not None:
+                    route_info.append("Start and end are the same intersection")
+                
+                reason_detail = "; ".join(route_info) if route_info else "Intersection nodes not found"
+                
                 coords_to_use = full_street_multiline(loc_key)
                 if coords_to_use:
                     geometry = {"type": "MultiLineString", "coordinates": coords_to_use}
@@ -2803,14 +3561,14 @@ def build_everything():
                         row, wo_id, geometry, color, district_val, ward_val, date_val, shift_val,
                         supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
                         loc_key=loc_key, from_key=from_key, to_key=to_key,
-                        route_mode="Location Not Found. Mapping Full Street as FALLBACK"
+                        route_mode=f"Points not found in centreline. Mapping Full Street as FALLBACK ({reason_detail})"
                     )
                     subsegment_count += 1
                     if is_intake_row:
                         intake_mapped_counter += 1
                         record_intake_debug(
                             "MAPPED", submission_id, wo_id,
-                            "Location Not Found. Mapping Full Street as FALLBACK",
+                            f"Points not found in centreline. Mapping Full Street as FALLBACK ({reason_detail})",
                             loc_raw, from_raw, to_raw, loc_key, from_key, to_key
                         )
                     continue
@@ -2827,6 +3585,21 @@ def build_everything():
                 continue
 
             path = shortest_path_for_street(loc_key, start_node, end_node)
+            
+            # DEBUG
+            if loc_key == "ST CLAIR AVENUE W" and start_node == 13461271:
+                if path:
+                    node_path, edge_idx = path
+                    log(f"DEBUG: Found path with {len(node_path)} nodes")
+                    log(f"DEBUG: First 5 nodes: {node_path[:5]}")
+                    log(f"DEBUG: Last 5 nodes: {node_path[-5:]}")
+                    if 13460295 in node_path:
+                        log(f"DEBUG: ⚠️  Path includes Yonge (13460295)!")
+                    else:
+                        log(f"DEBUG: ✅ Path does not include Yonge")
+                else:
+                    log(f"DEBUG: No path found on street")
+
 
             if path is None:
                 gpath = shortest_path_global(start_node, end_node)
@@ -2839,14 +3612,14 @@ def build_everything():
                             row, wo_id, geometry, color, district_val, ward_val, date_val, shift_val,
                             supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
                             loc_key=loc_key, from_key=from_key, to_key=to_key,
-                            route_mode="Location Not Found. Mapping Full Street as FALLBACK"
+                            route_mode="Path not found on street. Using global routing as FALLBACK"
                         )
                         subsegment_count += 1
                         if is_intake_row:
                             intake_mapped_counter += 1
                             record_intake_debug(
                                 "MAPPED", submission_id, wo_id,
-                                "Location Not Found. Mapping Full Street as FALLBACK",
+                                "Path not found on street. Using global routing as FALLBACK",
                                 loc_raw, from_raw, to_raw, loc_key, from_key, to_key
                             )
                         continue
@@ -3018,8 +3791,7 @@ def build_everything():
             "street_to_cross_count": int(len(street_to_cross)),
             "street_to_cross": street_to_cross,
         }
-
-
+    
 
 def format_date_from_picker(val: str) -> str:
     """
@@ -3124,6 +3896,7 @@ latest_build_stats = {"status": "not built yet"}
 latest_centre_streets = []
 latest_street_to_cross = {}
 latest_allowed_sets = {}
+
 
 
 INDEX_HTML = """
@@ -3448,68 +4221,82 @@ NEW_FORM_HTML = """
     @keyframes pulseWarn{ 0%{transform:scale(1)} 50%{transform:scale(1.03)} 100%{transform:scale(1)} }
     @keyframes shakeWarn{ 0%{transform:translateX(0)} 25%{transform:translateX(-2px)} 50%{transform:translateX(2px)} 75%{transform:translateX(-2px)} 100%{transform:translateX(0)} }
 
-    /* ===== Submitted “batch” table (the top table) — make it wrap and fit ===== */
+    /* ===== Submitted "batch" table (the top table) — make it wrap and fit ===== */
     table:not(#woTable){
-      width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
-      margin-top: 10px;
-      background: #ffffff;
-      border: 1px solid var(--stroke);
-      border-radius: 16px;
-      overflow: hidden;
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        margin-top: 10px;
+        background: #ffffff;
+        border: 1px solid var(--stroke);
+        border-radius: 16px;
+        overflow: hidden;
     }
     table:not(#woTable) thead{ display:none; } /* avoids horizontal scroll */
     table:not(#woTable) tbody tr{
-      display:grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 10px 12px;
-      padding: 12px;
-      border-bottom: 1px solid var(--stroke);
+        display:grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px 12px;
+        padding: 12px;
+        border-bottom: 1px solid var(--stroke);
     }
     table:not(#woTable) tbody tr:last-child{ border-bottom:none; }
     table:not(#woTable) tbody td{
-      border:none;
-      padding:0;
-      display:flex;
-      flex-direction:column;
-      gap: 6px;
-      min-width: 0;
+        border:none;
+        padding:0;
+        display:flex;
+        flex-direction:column;
+        gap: 6px;
+        min-width: 0;
     }
     table:not(#woTable) tbody td::before{
-      font-size: 11px;
-      color: var(--muted);
-      font-weight: 900;
-      letter-spacing: .04em;
-      text-transform: uppercase;
-      content: "";
+        font-size: 11px;
+        color: var(--muted);
+        font-weight: 900;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+        content: "";
     }
+    /* ✅ COMPLETE LABELS - matches 32-column table structure */
     table:not(#woTable) tbody td:nth-child(1)::before{ content:"WO"; }
     table:not(#woTable) tbody td:nth-child(2)::before{ content:"Date"; }
     table:not(#woTable) tbody td:nth-child(3)::before{ content:"District"; }
     table:not(#woTable) tbody td:nth-child(4)::before{ content:"Ward"; }
-    table:not(#woTable) tbody td:nth-child(5)::before{ content:"Supervisor"; }
-    table:not(#woTable) tbody td:nth-child(6)::before{ content:"Shift"; }
-    table:not(#woTable) tbody td:nth-child(7)::before{ content:"Type"; }
-    table:not(#woTable) tbody td:nth-child(8)::before{ content:"Dump Trucks"; }
-    table:not(#woTable) tbody td:nth-child(9)::before{ content:"Provider"; }
-    table:not(#woTable) tbody td:nth-child(10)::before{ content:"Loads"; }
-    table:not(#woTable) tbody td:nth-child(11)::before{ content:"Tonnes"; }
-    table:not(#woTable) tbody td:nth-child(12)::before{ content:"Side"; }
-    table:not(#woTable) tbody td:nth-child(13)::before{ content:"Road Side"; }
-    table:not(#woTable) tbody td:nth-child(14)::before{ content:"Snow Dump Site"; }
-    table:not(#woTable) tbody td:nth-child(15)::before{ content:"Comments"; }
-    table:not(#woTable) tbody td:nth-child(16)::before{ content:"Location"; }
-    table:not(#woTable) tbody td:nth-child(17)::before{ content:"From"; }
-    table:not(#woTable) tbody td:nth-child(18)::before{ content:"To"; }
-    table:not(#woTable) tbody td:nth-child(19)::before{ content:"Status"; }
-    table:not(#woTable) tbody td:nth-child(20)::before{ content:"Edit"; }
+    table:not(#woTable) tbody td:nth-child(5)::before{ content:"TOA Area"; }
+    table:not(#woTable) tbody td:nth-child(6)::before{ content:"Supervisor"; }
+    table:not(#woTable) tbody td:nth-child(7)::before{ content:"Shift"; }
+    table:not(#woTable) tbody td:nth-child(8)::before{ content:"Street"; }
+    table:not(#woTable) tbody td:nth-child(9)::before{ content:"From"; }
+    table:not(#woTable) tbody td:nth-child(10)::before{ content:"To"; }
+    table:not(#woTable) tbody td:nth-child(11)::before{ content:"Side Cleared"; }
+    table:not(#woTable) tbody td:nth-child(12)::before{ content:"Road Side"; }
+    table:not(#woTable) tbody td:nth-child(13)::before{ content:"Roadway"; }
+    table:not(#woTable) tbody td:nth-child(14)::before{ content:"Sidewalk"; }
+    table:not(#woTable) tbody td:nth-child(15)::before{ content:"Cycling"; }
+    table:not(#woTable) tbody td:nth-child(16)::before{ content:"Bridge"; }
+    table:not(#woTable) tbody td:nth-child(17)::before{ content:"School Zones"; }
+    table:not(#woTable) tbody td:nth-child(18)::before{ content:"Equipment"; }
+    table:not(#woTable) tbody td:nth-child(19)::before{ content:"Dump Trucks"; }
+    table:not(#woTable) tbody td:nth-child(20)::before{ content:"Source"; }
+    table:not(#woTable) tbody td:nth-child(21)::before{ content:"Contractor TOA"; }
+    table:not(#woTable) tbody td:nth-child(22)::before{ content:"Snow Dump Site"; }
+    table:not(#woTable) tbody td:nth-child(23)::before{ content:"Loads"; }
+    table:not(#woTable) tbody td:nth-child(24)::before{ content:"Tonnes"; }
+    table:not(#woTable) tbody td:nth-child(25)::before{ content:"Crew Type"; }
+    table:not(#woTable) tbody td:nth-child(26)::before{ content:"# Crews"; }
+    table:not(#woTable) tbody td:nth-child(27)::before{ content:"Crew Number"; }
+    table:not(#woTable) tbody td:nth-child(28)::before{ content:"In-House Base"; }
+    table:not(#woTable) tbody td:nth-child(29)::before{ content:"# Staff"; }
+    table:not(#woTable) tbody td:nth-child(30)::before{ content:"Notes"; }
+    table:not(#woTable) tbody td:nth-child(31)::before{ content:"Status"; }
+    table:not(#woTable) tbody td:nth-child(32)::before{ content:"Edit"; }
 
-    table:not(#woTable) tbody td:nth-child(15),
-    table:not(#woTable) tbody td:nth-child(16),
-    table:not(#woTable) tbody td:nth-child(17),
-    table:not(#woTable) tbody td:nth-child(18){
-      grid-column: 1 / -1; /* long text fields full width */
+    /* ✅ Make long text fields span full width */
+    table:not(#woTable) tbody td:nth-child(8),   /* Street */
+    table:not(#woTable) tbody td:nth-child(9),   /* From */
+    table:not(#woTable) tbody td:nth-child(10),  /* To */
+    table:not(#woTable) tbody td:nth-child(30){  /* Notes */
+    grid-column: 1 / -1;
     }
 
     /* ===== Entry table (woTable) — convert to responsive grid cards, no horizontal scroll ===== */
@@ -3551,37 +4338,56 @@ NEW_FORM_HTML = """
       content: "";
     }
 
-    /* Labels by column (matches your addRow() order) */
-    #woTable tbody td:nth-child(1)::before{ content:"WO"; }
-    #woTable tbody td:nth-child(2)::before{ content:"Date"; }
-    #woTable tbody td:nth-child(3)::before{ content:"District"; }
-    #woTable tbody td:nth-child(4)::before{ content:"Ward"; }
-    #woTable tbody td:nth-child(5)::before{ content:"Supervisor"; }
-    #woTable tbody td:nth-child(6)::before{ content:"Shift"; }
-    #woTable tbody td:nth-child(7)::before{ content:"Type"; }
-    #woTable tbody td:nth-child(8)::before{ content:"Dump Trucks"; }
-    #woTable tbody td:nth-child(9)::before{ content:"Provider"; }
-    #woTable tbody td:nth-child(10)::before{ content:"Loads"; }
-    #woTable tbody td:nth-child(11)::before{ content:"Tonnes"; }
-    #woTable tbody td:nth-child(12)::before{ content:"Side"; }
-    #woTable tbody td:nth-child(13)::before{ content:"Road Side"; }
-    #woTable tbody td:nth-child(14)::before{ content:"Snow Dump Site"; }
-    #woTable tbody td:nth-child(15)::before{ content:"Comments"; }
-    #woTable tbody td:nth-child(16)::before{ content:"Location"; }
-    #woTable tbody td:nth-child(17)::before{ content:"From"; }
-    #woTable tbody td:nth-child(18)::before{ content:"To"; }
-    #woTable tbody td:nth-child(19)::before{ content:"Remove"; }
+    /* Labels by column (MUST match addRow() order below) */
+    #woTable tbody td:nth-child(1)::before{ content:"Work Order Number"; }
+    #woTable tbody td:nth-child(2)::before{ content:"District (Where Snow Removed)"; }
+    #woTable tbody td:nth-child(3)::before{ content:"Ward (Where Snow Removed)"; }
+    #woTable tbody td:nth-child(4)::before{ content:"TOA Area (Where Snow Removed)"; }
+    #woTable tbody td:nth-child(5)::before{ content:"Street"; }
+    #woTable tbody td:nth-child(6)::before{ content:"From Intersection"; }
+    #woTable tbody td:nth-child(7)::before{ content:"To Intersection"; }
+    #woTable tbody td:nth-child(8)::before{ content:"One Side / Both Sides Cleared?"; }
+    #woTable tbody td:nth-child(9)::before{ content:"Side of Road Cleared"; }
+    #woTable tbody td:nth-child(10)::before{ content:"Roadway"; }
+    #woTable tbody td:nth-child(11)::before{ content:"Sidewalk"; }
+    #woTable tbody td:nth-child(12)::before{ content:"Separated Cycling Infrastructure"; }
+    #woTable tbody td:nth-child(13)::before{ content:"Bridge"; }
+    #woTable tbody td:nth-child(14)::before{ content:"School Loading Zones"; }
+    #woTable tbody td:nth-child(15)::before{ content:"Equipment Method"; }
+    #woTable tbody td:nth-child(16)::before{ content:"# of Equipment (Dump Trucks)"; }
+    #woTable tbody td:nth-child(17)::before{ content:"Dump Truck Source (In-House/Contractor)"; }
+    #woTable tbody td:nth-child(18)::before{ content:"Snow Dump Site"; }
+    #woTable tbody td:nth-child(19)::before{ content:"# of Loads"; }
+    #woTable tbody td:nth-child(20)::before{ content:"Tonnes"; }
+    #woTable tbody td:nth-child(21)::before{ content:"Shift Start Date"; }
+    #woTable tbody td:nth-child(22)::before{ content:"Shift Start Time"; }
+    #woTable tbody td:nth-child(23)::before{ content:"Shift End Date"; }
+    #woTable tbody td:nth-child(24)::before{ content:"Shift End Time"; }
+    #woTable tbody td:nth-child(25)::before{ content:"Supervisor 1"; }
+    #woTable tbody td:nth-child(26)::before{ content:"Supervisor 2 (if relevant)"; }
+    #woTable tbody td:nth-child(27)::before{ content:"Supervisor 3 (if relevant)"; }
+    #woTable tbody td:nth-child(28)::before{ content:"Snow Removal by Contracted Crew or In-House?"; }
+    #woTable tbody td:nth-child(29)::before{ content:"Contractor: # of Crews"; }
+    #woTable tbody td:nth-child(30)::before{ content:"Contractor: Crew TOA Area Responsibility"; }
+    #woTable tbody td:nth-child(31)::before{ content:"Contractor: Crew Number"; }
+    #woTable tbody td:nth-child(32)::before{ content:"In-House: Staff Responsibility (Base Yard)"; }
+    #woTable tbody td:nth-child(33)::before{ content:"In-House: # of Staff"; }
+    #woTable tbody td:nth-child(34)::before{ content:"NOTES"; }
+    #woTable tbody td:nth-child(35)::before{ content:"Remove"; }
 
-    /* Field sizing + spans (fixes your “too small / too big” complaints) */
-    #woTable tbody td:nth-child(1){ grid-column: span 2; }  /* WO bigger (20-digit visible) */
-    #woTable tbody td:nth-child(5){ grid-column: span 2; }  /* Supervisor bigger */
-    #woTable tbody td:nth-child(7){ grid-column: span 2; }  /* Type bigger */
-    #woTable tbody td:nth-child(9){ grid-column: span 2; }  /* Provider bigger */
+    /* Spans / sizing (optional but recommended) */
+    #woTable tbody td:nth-child(1){ grid-column: span 2; }      /* WO bigger */
+    #woTable tbody td:nth-child(5){ grid-column: span 2; }      /* Street bigger */
+    #woTable tbody td:nth-child(15){ grid-column: span 2; }     /* Equipment Method bigger */
+    #woTable tbody td:nth-child(30){ grid-column: span 2; }     /* Crew responsibility bigger */
+    #woTable tbody td:nth-child(34){ grid-column: 1 / -1; }     /* NOTES full width */
 
-    #woTable tbody td:nth-child(15){ grid-column: 1 / -1; } /* Comments full width */
-    #woTable tbody td:nth-child(16){ grid-column: span 2; } /* Location bigger */
-    #woTable tbody td:nth-child(17){ grid-column: span 2; } /* From bigger */
-    #woTable tbody td:nth-child(18){ grid-column: span 2; } /* To bigger */
+    #woTable tbody td:nth-child(5),
+    #woTable tbody td:nth-child(6),
+    #woTable tbody td:nth-child(7){
+    grid-column: span 2; /* Street + From/To bigger */
+    }
+
 
     /* Make dump trucks feel “small”, loads readable */
     #woTable tbody td:nth-child(8) input{ text-align:right; }
@@ -3751,68 +4557,92 @@ NEW_FORM_HTML = """
     </div>
 
     <table style="margin-top:10px;">
-      <thead>
+    <thead>
         <tr>
-            <th>WO</th>
-            <th>Date</th>
-            <th>District</th>
-            <th>Ward</th>
-            <th>Supervisor</th>
-            <th>Shift</th>
-            <th>Type</th>
-            <th>Dump Trucks</th>
-            <th>Dump Truck Provider</th>
-            <th>Loads</th>
-            <th>Tonnes</th>
-            <th>Side</th>
-            <th>Road Side</th>
-            <th>Snow Dump Site</th>
-            <th>Comments</th>
-            <th>Location</th>
-            <th>From</th>
-            <th>To</th>
-            <th>Status</th>
-            <th>Edit</th>
+        <th>Work Order Number</th>
+        <th>Date</th>
+        <th>District</th>
+        <th>Ward</th>
+        <th>TOA Area</th>
+        <th>Supervisor</th>
+        <th>Shift</th>
+        <th>Street</th>
+        <th>From Intersection</th>
+        <th>To Intersection</th>
+        <th>Side Cleared</th>
+        <th>Road Side</th>
+        <th>Roadway</th>
+        <th>Sidewalk</th>
+        <th>Cycling</th>
+        <th>Bridge</th>
+        <th>School Zones</th>
+        <th>Equipment Method</th>
+        <th>Dump Trucks</th>
+        <th>Dump Truck Source</th>
+        <th>Contractor TOA</th>
+        <th>Snow Dump Site</th>
+        <th>Loads</th>
+        <th>Tonnes</th>
+        <th>Crew Type</th>
+        <th># Crews</th>
+        <th>Crew Number</th>
+        <th>In-House Base</th>
+        <th># Staff</th>
+        <th>Notes</th>
+        <th>Status</th>
+        <th>Edit</th>
         </tr>
-      </thead>
-      <tbody>
-      {% for r in batch %}
+    </thead>
+    <tbody>
+    {% for r in batch %}
         <tr>
-          <td>{{ r.get('WO','') }}</td>
-          <td>{{ r.get('Date\\n','') }}</td>
-          <td>{{ r.get('District\\n','') }}</td>
-          <td>{{ r.get('Ward\\n','') }}</td>
-          <td>{{ r.get('Supervisor\\n','') }}</td>
-          <td>{{ r.get('Shift\\n','') }}</td>
-          <td>{{ r.get('Type (Road Class/ School, Bridge)\\n','') }}</td>
-          <td>{{ r.get('# of Equipment (Dump Trucks)','') }}</td>
-          <td>{{ r.get('Dump Truck Provider Contractor','') }}</td>
-          <td>{{ r.get('# of Loads','') }}</td>
-          <td>{{ r.get('Tonnes','') }}</td>
-          <td>{{ r.get('One Side/ Both Sides','') }}</td>
-          <td>{{ r.get('Side of Road Cleared','') }}</td>
-          <td>{{ r.get('Snow Dumped Site','') }}</td>
-          <td style="max-width:220px;">{{ r.get('Comments','') }}</td>
-          <td>{{ r.get('Location','') }}</td>
-          <td>{{ r.get('From ','') }}</td>
-          <td>{{ r.get('To','') }}</td>
-          <td>
+        <td>{{ r.get('Work Order Number','') }}</td>
+        <td>{{ r.get('Shift Start Date','') }}</td>
+        <td>{{ r.get('District (Where Snow Removed)','') }}</td>
+        <td>{{ r.get('Ward (Where Snow Removed)','') }}</td>
+        <td>{{ r.get('TOA Area (Where Snow Removed)','') }}</td>
+        <td>{{ r.get('Supervisor 1','') }}</td>
+        <td>{{ r.get('Shift Start Time','') }} - {{ r.get('Shift End Time','') }}</td>
+        <td>{{ r.get('Street','') }}</td>
+        <td>{{ r.get('From Intersection','') }}</td>
+        <td>{{ r.get('To Intersection','') }}</td>
+        <td>{{ r.get('One Side / Both Sides Cleared?','') }}</td>
+        <td>{{ r.get('Side of Road Cleared','') }}</td>
+        <td>{{ r.get('Infrastructure Type: Roadway','') }}</td>
+        <td>{{ r.get('Infrastructure Type: Sidewalk','') }}</td>
+        <td>{{ r.get('Infrastructure Type: Separated Cycling Infrastructure','') }}</td>
+        <td>{{ r.get('Infrastructure Type: Bridge','') }}</td>
+        <td>{{ r.get('Infrastructure Type: School Loading Zones','') }}</td>
+        <td>{{ r.get('Equipment Method','') }}</td>
+        <td>{{ r.get('# of Equipment (Dump Trucks)','') }}</td>
+        <td>{{ r.get('Dump Truck Source (In-House/Contractor)','') }}</td>
+        <td>{{ r.get('Contractor: Crew TOA Area Responsibility','') }}</td>
+        <td>{{ r.get('Snow Dump Site','') }}</td>
+        <td>{{ r.get('# of Loads','') }}</td>
+        <td>{{ r.get('Tonnes','') }}</td>
+        <td>{{ r.get('Snow Removal by Contracted Crew or In-House?','') }}</td>
+        <td>{{ r.get('Contractor: # of Crews','') }}</td>
+        <td>{{ r.get('Contractor: Crew Number','') }}</td>
+        <td>{{ r.get('In-House: Staff Responsibility (Base Yard)','') }}</td>
+        <td>{{ r.get('In-House: # of Staff','') }}</td>
+        <td style="max-width:220px;">{{ r.get('NOTES','') }}</td>
+        <td>
             {% set st = (r.get('__status','')|string)|upper %}
             <span class="statusPill {{ 'statusApplied' if st=='APPLIED' else 'statusPending' }}"
-                  data-sid="{{ r.get('__submission_id','') }}">
-              {{ st if st else '—' }}
+                    data-sid="{{ r.get('__submission_id','') }}">
+                {{ st if st else '—' }}
             </span>
-          </td>
-          <td>
+        </td>
+        <td>
             {% if (r.get('__status','')|upper) == 'PENDING' %}
-              <a href="/edit/{{ r.get('__submission_id','') }}?bid={{ batch_id }}">Edit</a>
+            <a href="/edit/{{ r.get('__submission_id','') }}?bid={{ batch_id }}">Edit</a>
             {% else %}
-              <span style="color:#777;">Locked</span>
+            <span style="color:#777;">Locked</span>
             {% endif %}
-          </td>
+        </td>
         </tr>
-      {% endfor %}
-      </tbody>
+    {% endfor %}
+    </tbody>
     </table>
   </div>
   {% endif %}
@@ -3837,28 +4667,30 @@ NEW_FORM_HTML = """
 
       <table id="woTable">
         <thead>
-          <tr>
-            <th style="width:110px;">WO</th>
-            <th style="width:150px;">Date</th>
-            <th style="width:90px;">District</th>
-            <th style="width:90px;">Ward</th>
-            <th style="width:180px;">Supervisor</th>
-            <th style="width:180px;">Shift</th>
-            <th style="width:220px;">Type</th>
-            <th style="width:140px;">Dump Trucks</th>
-            <th style="width:160px;">Dump Truck Provider</th>
-            <th style="width:120px;">Loads</th>
-            <th style="width:120px;">Tonnes</th>
-            <th style="width:140px;">Side</th>
-            <th style="width:160px;">Road Side</th>
-            <th style="width:180px;">Snow Dump Site</th>
-            <th style="width:260px;">Comments</th>
-            <th>Location</th>
-            <th>From</th>
-            <th>To</th>
-            <th style="width:80px;">Remove</th>
-          </tr>
-        </thead>
+        <tr>
+            <th>Work Order Number</th>
+            <th>Shift Start Date</th>
+            <th>District (Where Snow Removed)</th>
+            <th>Ward (Where Snow Removed)</th>
+            <th>TOA Area (Where Snow Removed)</th>
+            <th>Supervisor 1</th>
+            <th>Shift Start Time - Shift End Time</th>
+            <th>Equipment Method</th>
+            <th># of Equipment (Dump Trucks)</th>
+            <th>Contractor: Crew TOA Area Responsibility</th>
+            <th># of Loads</th>
+            <th>Tonnes</th>
+            <th>One Side / Both Sides Cleared?</th>
+            <th>Side of Road Cleared</th>
+            <th>Snow Dump Site</th>
+            <th>NOTES</th>
+            <th>Street</th>
+            <th>Street/From Intersection</th>
+            <th>Street/To Intersection</th>
+            <th>Status</th>
+            <th>Edit</th>
+        </tr>
+      </thead>
         <tbody id="woTbody"></tbody>
       </table>
 
@@ -3895,6 +4727,7 @@ NEW_FORM_HTML = """
   var types = {{ types_json | safe }};
   var dumpTruckProvidersOptions = {{ dump_truck_providers_html | tojson | safe }};
   var snowDumpSitesOptions = {{ snow_dump_sites_html | tojson | safe }};
+  var STREET_ENDPOINTS = {{ street_endpoints_json | safe }};
 
 
   var tbody = document.getElementById('woTbody');
@@ -3915,19 +4748,12 @@ NEW_FORM_HTML = """
     });
   }
 
-  async function fetchCrossStreets(locationVal){
-    var loc = (locationVal || '').toString().trim();
-    if (!loc) return { matched_location: "", cross_streets: [] };
-    try{
-      var resp = await fetch('/api/cross_streets?location=' + encodeURIComponent(loc));
-      if(!resp.ok) throw new Error('bad resp');
-      return await resp.json();
-    }catch(e){
-      return { matched_location: "", cross_streets: [] };
-    }
+  function endpointsForStreet(streetVal){
+    var k = (streetVal || '').toString().trim().toUpperCase();
+    if (!k) return [];
+    if (STREET_ENDPOINTS && STREET_ENDPOINTS[k]) return STREET_ENDPOINTS[k];
+    return [];
   }
-
-  
 
   function optList(arr){
     return (arr || []).map(function(x){
@@ -3981,171 +4807,163 @@ NEW_FORM_HTML = """
   }
 
 
+  function simpleSelectHtml(name, arr){
+    var o = '<option value="">--</option>';
+    (arr || []).forEach(function(x){
+        o += '<option value="' + escapeHtml(x) + '">' + escapeHtml(x) + '</option>';
+    });
+    return '<select name="' + name + '">' + o + '</select>';
+  }
+
+  function yesNoSelectHtml(name){
+    return simpleSelectHtml(name, ['Yes','No']);
+  }
+
+  function toaSelectHtml(name){
+    var toaAreas = ['TOA 1-1', 'TOA 1-2', 'TOA 1-3', 'TOA 1-4', 'TOA 1-5',
+                    'TOA 2-1', 'TOA 2-2', 'TOA 2-3', 'TOA 2-4', 'TOA 2-5',
+                    'DVP-FGGE'];
+    var o = '<option value="">--</option>';
+    toaAreas.forEach(function(t){
+        o += '<option value="' + escapeHtml(t) + '">' + escapeHtml(t) + '</option>';
+    });
+    return '<select name="' + name + '">' + o + '</select>';
+  }
+
   function typeSelectHtml(name){
-    var o = '<option value="">--</option>' + optList(types);
+    var o = '<option value="">--</option>';
+    (types || []).forEach(function(t){
+        o += '<option value="' + escapeHtml(t) + '">' + escapeHtml(t) + '</option>';
+    });
     return '<select name="' + name + '" required>' + o + '</select>';
   }
 
+
+
   function addRow(prefill){
+    prefill = prefill || {};
     var idx = tbody.children.length;
     var tr = document.createElement('tr');
 
     tr.innerHTML = ''
-      + '<td><input name="WO_' + idx + '" required placeholder="12345"></td>'
-      + '<td><input type="date" name="Date__NL_' + idx + '" required></td>'
-      + '<td>' + districtSelectHtml('District__NL_' + idx) + '</td>'
-      + '<td>' + wardSelectHtml('Ward__NL_' + idx) + '</td>'
-      + '<td><input name="Supervisor__NL_' + idx + '" list="supervisors_list" required placeholder="Supervisor"></td>'
-      + '<td>' + shiftTimeHtml('Shift__NL_' + idx, 'ShiftStart__NL_' + idx, 'ShiftEnd__NL_' + idx) + '</td>'
-      + '<td>' + typeSelectHtml('Type__NL_' + idx) + '</td>'
-      + '<td><input name="# of Equipment (Dump Trucks)_' + idx + '" type="number" min="0"></td>'
-      + '<td><select name="Dump Truck Provider Contractor_' + idx + '">'
-      +   '<option value="">--</option>'
-      +   dumpTruckProvidersOptions
-      + '</select></td>'
-      + '<td><input name="# of Loads_' + idx + '" type="number" min="0"></td>'
-      + '<td><input name="Tonnes_' + idx + '" type="number" step="0.01" min="0"></td>'
-      + '<td><select name="One Side/ Both Sides_' + idx + '">'
-      +   '<option value="">--</option>'
-      +   '<option>Both Sides</option>'
-      +   '<option>One Side</option>'
-      + '</select></td>'
-      + '<td><select name="Side of Road Cleared_' + idx + '">'
-      +   '<option value="">--</option>'
-      +   '<option>North</option><option>South</option>'
-      +   '<option>East</option><option>West</option>'
-      +   '<option>East/West</option><option>North/South</option>'
-      + '</select></td>'
-      + '<td><select name="Snow Dumped Site_' + idx + '">'
-      +   '<option value="">--</option>'
-      +   snowDumpSitesOptions
-      + '</select></td>'
-      + '<td><textarea name="Comments_' + idx + '" rows="2" '
-      +   'style="width:100%;padding:9px 10px;border-radius:10px;border:1px solid #ccc;font-size:14px;resize:vertical;" '
-      +   'placeholder="Notes / comments (optional)"></textarea></td>'
-      + '<td><input class="locIn" name="Location_' + idx + '" list="streets" required placeholder="Location"></td>'
-      + '<td><input class="fromIn" name="From_' + idx + '" placeholder="From (cross street)"></td>'
-      + '<td><input class="toIn" name="To_' + idx + '" placeholder="To (cross street)"></td>'
-      + '<td><button type="button" class="ghost rmBtn">Remove</button></td>';
+        + '<td><input name="Work Order Number_' + idx + '" required placeholder="12345" value="' + escapeHtml(prefill["Work Order Number"] || "") + '"></td>'
+
+        + '<td>' + districtSelectHtml('District (Where Snow Removed)_' + idx) + '</td>'
+        + '<td>' + wardSelectHtml('Ward (Where Snow Removed)_' + idx) + '</td>'
+
+        + '<td>' + toaSelectHtml('TOA Area (Where Snow Removed)_' + idx) + '</td>'
+
+        + '<td><input class="streetIn" name="Street_' + idx + '" list="streets" required placeholder="Street" value="' + escapeHtml(prefill["Street"] || "") + '"></td>'
+        + '<td><input class="fromIn" name="From Intersection_' + idx + '" placeholder="From Intersection" value="' + escapeHtml(prefill["From Intersection"] || "") + '"></td>'
+        + '<td><input class="toIn" name="To Intersection_' + idx + '" placeholder="To Intersection" value="' + escapeHtml(prefill["To Intersection"] || "") + '"></td>'
+
+        + '<td>' + simpleSelectHtml('One Side / Both Sides Cleared?_' + idx, ['Both Sides','One Side']) + '</td>'
+        + '<td>' + simpleSelectHtml('Side of Road Cleared_' + idx, ['North','South','East','West','East/West','North/South']) + '</td>'
+
+        + '<td>' + yesNoSelectHtml('Roadway_' + idx) + '</td>'
+        + '<td>' + yesNoSelectHtml('Sidewalk_' + idx) + '</td>'
+        + '<td>' + yesNoSelectHtml('Separated Cycling Infrastructure_' + idx) + '</td>'
+        + '<td>' + yesNoSelectHtml('Bridge_' + idx) + '</td>'
+        + '<td>' + yesNoSelectHtml('School Loading Zones_' + idx) + '</td>'
+
+        + '<td>' + typeSelectHtml('Equipment Method_' + idx) + '</td>'
+
+        + '<td><input name="# of Equipment (Dump Trucks)_' + idx + '" type="number" min="0" value="' + escapeHtml(prefill["# of Equipment (Dump Trucks)"] || "") + '"></td>'
+
+        + '<td>' + simpleSelectHtml('Dump Truck Source (In-House/Contractor)_' + idx, ['In-House','Contractor']) + '</td>'
+
+        + '<td><select name="Snow Dump Site_' + idx + '">'
+        +   '<option value="">--</option>'
+        +   snowDumpSitesOptions
+        + '</select></td>'
+
+        + '<td><input name="# of Loads_' + idx + '" type="number" min="0" value="' + escapeHtml(prefill["# of Loads"] || "") + '"></td>'
+        + '<td><input name="Tonnes_' + idx + '" type="number" step="0.01" min="0" value="' + escapeHtml(prefill["Tonnes"] || "") + '"></td>'
+
+        + '<td><input type="date" name="Shift Start Date_' + idx + '" required value="' + escapeHtml(prefill["Shift Start Date"] || "") + '"></td>'
+        + '<td><input type="time" name="Shift Start Time_' + idx + '" required value="' + escapeHtml(prefill["Shift Start Time"] || "") + '"></td>'
+        + '<td><input type="date" name="Shift End Date_' + idx + '" value="' + escapeHtml(prefill["Shift End Date"] || "") + '"></td>'
+        + '<td><input type="time" name="Shift End Time_' + idx + '" required value="' + escapeHtml(prefill["Shift End Time"] || "") + '"></td>'
+
+        + '<td><input name="Supervisor 1_' + idx + '" list="supervisors_list" required placeholder="Supervisor 1" value="' + escapeHtml(prefill["Supervisor 1"] || "") + '"></td>'
+        + '<td><input name="Supervisor 2 (if relevant)_' + idx + '" placeholder="Supervisor 2" value="' + escapeHtml(prefill["Supervisor 2 (if relevant)"] || "") + '"></td>'
+        + '<td><input name="Supervisor 3 (if relevant)_' + idx + '" placeholder="Supervisor 3" value="' + escapeHtml(prefill["Supervisor 3 (if relevant)"] || "") + '"></td>'
+
+        + '<td>' + simpleSelectHtml('Snow Removal by Contracted Crew or In-House?_' + idx, ['Contracted Crew','In-House']) + '</td>'
+
+        + '<td><input name="Contractor: # of Crews_' + idx + '" placeholder="e.g. 2" value="' + escapeHtml(prefill["Contractor: # of Crews"] || "") + '"></td>'
+
+        + '<td><select name="Contractor: Crew TOA Area Responsibility_' + idx + '">'
+        +   '<option value="">--</option>'
+        +   dumpTruckProvidersOptions
+        + '</select></td>'
+
+        + '<td><input name="Contractor: Crew Number_' + idx + '" placeholder="Crew #" value="' + escapeHtml(prefill["Contractor: Crew Number"] || "") + '"></td>'
+
+        + '<td><input name="In-House: Staff Responsibility (Base Yard)_' + idx + '" placeholder="Base Yard" value="' + escapeHtml(prefill["In-House: Staff Responsibility (Base Yard)"] || "") + '"></td>'
+        + '<td><input name="In-House: # of Staff_' + idx + '" type="number" min="0" value="' + escapeHtml(prefill["In-House: # of Staff"] || "") + '"></td>'
+
+        + '<td><textarea name="NOTES_' + idx + '" rows="2" placeholder="Notes / comments (optional)">' + escapeHtml(prefill["NOTES"] || "") + '</textarea></td>'
+
+        + '<td><button type="button" class="ghost rmBtn">Remove</button></td>';
 
     tbody.appendChild(tr);
-    
-    if(prefill){
-        tr.querySelector('[name="WO_' + idx + '"]').value = prefill.WO || '';
-        tr.querySelector('[name="District__NL_' + idx + '"]').value = prefill.District || '';
-        tr.querySelector('[name="District__NL_' + idx + '"]').dispatchEvent(new Event('change'));
-        tr.querySelector('[name="Ward__NL_' + idx + '"]').value = prefill.Ward || '';
-        tr.querySelector('[name="Date__NL_' + idx + '"]').value = prefill.Date || '';
-        tr.querySelector('[name="Supervisor__NL_' + idx + '"]').value = prefill.Supervisor || '';
 
-        tr.querySelector('[name="Location_' + idx + '"]').value = prefill.Location || '';
-        tr.querySelector('[name="From_' + idx + '"]').value = prefill.From || '';
-        tr.querySelector('[name="To_' + idx + '"]').value = prefill.To || '';
-        tr.querySelector('[name="Type__NL_' + idx + '"]').value = prefill.Type || '';
+    // ✅ Remove row
+    tr.querySelector('.rmBtn').onclick = function(){
+        tr.remove();
+    };
 
-        tr.querySelector('[name="# of Equipment (Dump Trucks)_' + idx + '"]').value = prefill.DumpTrucks || '';
-        tr.querySelector('[name="Dump Truck Provider Contractor_' + idx + '"]').value = prefill.Provider || '';
-        tr.querySelector('[name="# of Loads_' + idx + '"]').value = prefill.Loads || '';
-        tr.querySelector('[name="Tonnes_' + idx + '"]').value = prefill.Tonnes || '';
-        tr.querySelector('[name="One Side/ Both Sides_' + idx + '"]').value = prefill.SideBoth || '';
-        tr.querySelector('[name="Side of Road Cleared_' + idx + '"]').value = prefill.RoadSide || '';
-        tr.querySelector('[name="Snow Dumped Site_' + idx + '"]').value = prefill.SnowSite || '';
-        tr.querySelector('[name="Comments_' + idx + '"]').value = prefill.Comments || '';
+    // ✅ District → Ward dependency
+    var dsel = tr.querySelector('.districtSel');
+    var wsel = tr.querySelector('.wardSel');
 
-        // Prefill shift if stored as "06:30AM - 06:30PM"
-        var sh = (prefill.Shift || '').replace('–','-').replace('—','-');
-        var parts = sh.split('-').map(function(x){ return x.trim(); }).filter(Boolean);
-
-        function to24(tok){
-            tok = String(tok||'').trim().toUpperCase().replace(/\\s+/g,'');
-            var m = tok.match(/^(\d{1,2}):(\d{2})(AM|PM)$/);
-            if(!m) return '';
-            var h = parseInt(m[1],10), mm = m[2], ap = m[3];
-            var hh24 = (h % 12) + (ap === 'PM' ? 12 : 0);
-            return String(hh24).padStart(2,'0') + ':' + mm;
-        }
-
-        if(parts.length >= 2){
-            var s24 = to24(parts[0]), e24 = to24(parts[1]);
-            if(s24) tr.querySelector('[name="ShiftStart__NL_' + idx + '"]').value = s24;
-            if(e24) tr.querySelector('[name="ShiftEnd__NL_' + idx + '"]').value = e24;
-        }
+    function setWards(d){
+        var dd = (d||'').toString().trim().toUpperCase();
+        var wards = (districtToWards && districtToWards[dd]) ? districtToWards[dd] : [];
+        wsel.innerHTML = '<option value="">--</option>';
+        wards.forEach(function(w){
+        var opt = document.createElement('option');
+        opt.value = w; opt.textContent = w;
+        wsel.appendChild(opt);
+        });
     }
+    dsel.addEventListener('change', function(){ setWards(dsel.value); });
 
-
-    // --- Shift time inputs -> hidden combined value (Shift__NL_idx) ---
-    var tStart = tr.querySelector('.tStart');
-    var tEnd = tr.querySelector('.tEnd');
-    var tHidden = tr.querySelector('.shiftCombined');
-
-    function updateShiftHidden(){
-      var a = fmt12FromTimeInput(tStart.value);
-      var b = fmt12FromTimeInput(tEnd.value);
-      tHidden.value = (a && b) ? (a + ' - ' + b) : '';
-    }
-    tStart.addEventListener('change', updateShiftHidden);
-    tEnd.addEventListener('change', updateShiftHidden);
-
-    // --- Location → To/From dependent lists (cross streets) ---
-    var locIn = tr.querySelector('.locIn');
+    // ✅ Street → cross streets
+    var streetIn = tr.querySelector('.streetIn');
     var toIn = tr.querySelector('.toIn');
     var fromIn = tr.querySelector('.fromIn');
 
     var dlTo = document.createElement('datalist');
     dlTo.id = 'cross_to_' + idx;
-    dlTo.setAttribute('data-crosslist','1');
     crossListsHost.appendChild(dlTo);
     toIn.setAttribute('list', dlTo.id);
 
     var dlFrom = document.createElement('datalist');
     dlFrom.id = 'cross_from_' + idx;
-    dlFrom.setAttribute('data-crosslist','1');
     crossListsHost.appendChild(dlFrom);
     fromIn.setAttribute('list', dlFrom.id);
 
     var cachedCross = [];
 
-    async function refreshCrossLists(){
-    var data = await fetchCrossStreets(locIn.value);
-    cachedCross = (data && data.cross_streets) ? data.cross_streets : [];
-    populateDatalist(dlTo, cachedCross, fromIn.value);
-    populateDatalist(dlFrom, cachedCross, toIn.value);
+    function refreshCrossLists(){
+        cachedCross = endpointsForStreet(streetIn.value);
+        populateDatalist(dlTo, cachedCross, fromIn.value);
+        populateDatalist(dlFrom, cachedCross, toIn.value);
     }
 
-    locIn.addEventListener('change', refreshCrossLists);
-    locIn.addEventListener('blur', refreshCrossLists);
+    streetIn.addEventListener('change', refreshCrossLists);
+    streetIn.addEventListener('blur', refreshCrossLists);
 
     toIn.addEventListener('change', function(){
-    populateDatalist(dlFrom, cachedCross, toIn.value);
+        populateDatalist(dlFrom, cachedCross, toIn.value);
     });
     fromIn.addEventListener('change', function(){
-    populateDatalist(dlTo, cachedCross, fromIn.value);
+        populateDatalist(dlTo, cachedCross, fromIn.value);
     });
-
-
-    var rm = tr.querySelector('.rmBtn');
-    rm.onclick = function(){
-      tr.remove();
-      // reindex on remove (simple approach)
-      reindex();
-    };
-
-    var dsel = tr.querySelector('.districtSel');
-    var wsel = tr.querySelector('.wardSel');
-
-    function setWards(d){
-      var dd = (d||'').toString().trim().toUpperCase();
-      var wards = districtToWards[dd] || [];
-      wsel.innerHTML = '<option value="">--</option>';
-      wards.forEach(function(w){
-        var opt = document.createElement('option');
-        opt.value = w; opt.textContent = w;
-        wsel.appendChild(opt);
-      });
-      if (wards.length) wsel.value = wards[0];
-    }
-    dsel.addEventListener('change', function(){ setWards(dsel.value); });
   }
+
 
   function reindex(){
     // Rebuild names so backend can parse 0..N cleanly
@@ -4158,7 +4976,8 @@ NEW_FORM_HTML = """
     });
   }
 
-  addBtn.onclick = addRow;
+  addBtn.addEventListener('click', function(){ addRow(); });
+
 
   // start with 1 row
   // start with 1 row (or prefill rows if backend returned errors)
@@ -4275,7 +5094,8 @@ NEW_FORM_HTML = """
     setTimeout(tick, 1000);
   }
 
-  if (extendBtn){
+  if (extendBtn && !extendBtn.dataset.bound){
+    extendBtn.dataset.bound = "1";
     extendBtn.addEventListener('click', async function(){
       try{
         extendBtn.disabled = true;
@@ -4296,7 +5116,7 @@ NEW_FORM_HTML = """
     dismissBtn.addEventListener('click', function(){
       panel.style.display = 'none';
       // focus first WO input for next entry
-      var firstWo = document.querySelector('input[name="WO_0"]');
+      var firstWo = document.querySelector('input[name="Work Order Number_0"]');
       if (firstWo) firstWo.focus();
     });
   }
@@ -4310,6 +5130,8 @@ NEW_FORM_HTML = """
 </body>
 </html>
 """
+
+
 EDIT_FORM_HTML = """
 <!doctype html>
 <html>
@@ -4349,7 +5171,7 @@ EDIT_FORM_HTML = """
     }
 
     .card{
-      max-width: 980px;
+      max-width: 1200px;
       margin: 0 auto 14px auto;
       border: 1px solid var(--stroke);
       background: var(--card);
@@ -4361,26 +5183,6 @@ EDIT_FORM_HTML = """
     h2{ margin:0 0 6px 0; font-size: 20px; font-weight: 950; letter-spacing:-0.02em; }
     a{ color: var(--brand); text-decoration:none; font-weight: 850; }
     a:hover{ text-decoration: underline; }
-
-    label{ display:block; margin-top: 12px; font-weight: 900; color: #111827; }
-    input, select, textarea{
-      width: 100%;
-      padding: 10px 11px;
-      border-radius: 12px;
-      border: 1px solid #d1d5db;
-      background: #ffffff;
-      color: #111827;
-      font-size: 14px;
-      font-weight: 650;
-      outline: none;
-      transition: border-color .12s ease, box-shadow .12s ease;
-    }
-    textarea{ min-height: 140px; resize: vertical; line-height: 1.3; } /* bigger glanceable comments */
-    input:focus, select:focus, textarea:focus{
-      border-color: rgba(0,90,163,0.45);
-      box-shadow: 0 0 0 4px rgba(14,165,233,0.16);
-    }
-    select, option{ color:#111827; background:#ffffff; }
 
     .help{ color: var(--muted); font-size: 13px; margin-top: 6px; font-weight: 650; }
 
@@ -4404,8 +5206,7 @@ EDIT_FORM_HTML = """
     }
 
     button{
-      margin-top: 14px;
-      padding: 12px 14px;
+      padding: 11px 13px;
       border-radius: 14px;
       border: 1px solid rgba(0,90,163,0.20);
       background: linear-gradient(135deg, var(--brand), var(--brand2));
@@ -4414,6 +5215,7 @@ EDIT_FORM_HTML = """
       cursor:pointer;
       box-shadow: 0 14px 34px rgba(0,90,163,0.18);
       transition: transform .12s ease, filter .12s ease;
+      user-select:none;
     }
     button:hover{ transform: translateY(-1px); filter: brightness(1.03); }
     button:active{ transform: translateY(0px) scale(.99); }
@@ -4424,35 +5226,171 @@ EDIT_FORM_HTML = """
       box-shadow:none;
     }
 
-    code{
-      background: #f3f4f6;
-      border: 1px solid #e5e7eb;
-      padding:2px 8px;
-      border-radius:999px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-size: 12px;
+    input, select, textarea{
+      width: 100%;
+      padding: 10px 11px;
+      border-radius: 12px;
+      border: 1px solid #d1d5db;
+      background: #ffffff;
       color: #111827;
+      font-size: 14px;
+      font-weight: 650;
+      outline: none;
+      transition: border-color .12s ease, box-shadow .12s ease;
+      min-width:0;
     }
-    /* Edit timer button styling safety */
+    textarea{
+      min-height: 110px;
+      resize: vertical;
+      line-height: 1.3;
+    }
+    input:focus, select:focus, textarea:focus{
+      border-color: rgba(0,90,163,0.45);
+      box-shadow: 0 0 0 4px rgba(14,165,233,0.16);
+    }
+    select, option{ color:#111827; background:#ffffff; }
+
+    /* ===== Timer styling ===== */
+    #editTimerBox{
+      border: 1px solid var(--stroke) !important;
+      background: #f9fafb !important;
+      border-radius: 16px !important;
+    }
+    #editPendingTimer{
+      font-variant-numeric: tabular-nums;
+      font-weight: 950;
+      color: #6b7280;
+    }
+    #editPendingTimer.timerWarn,
+    #editPendingTimer.timerFinal{
+      color: var(--danger);
+    }
+    .timerWarn{ animation: pulseWarn 0.9s infinite; }
+    .timerFinal{ animation: pulseWarn 0.35s infinite, shakeWarn 0.35s infinite; }
+    @keyframes pulseWarn{ 0%{transform:scale(1)} 50%{transform:scale(1.03)} 100%{transform:scale(1)} }
+    @keyframes shakeWarn{ 0%{transform:translateX(0)} 25%{transform:translateX(-2px)} 50%{transform:translateX(2px)} 75%{transform:translateX(-2px)} 100%{transform:translateX(0)} }
+
     #editExtendBtn{
       background:#6b7280 !important;
       color:#fff !important;
       border-color: rgba(0,0,0,0.10) !important;
+      padding:6px 10px !important;
+      border-radius:999px !important;
+      font-size:12px !important;
+      box-shadow:none !important;
     }
-    .timeRange { display:flex; align-items:center; gap:6px; white-space:nowrap; }
-    .timeRange input[type="time"]{
-      width: 170px;
-      padding: 10px;
-      border-radius: 10px;
-      border: 1px solid #ccc;
-      background:#fff;
-    }
-    .timeRange .dash{ font-weight:900; color:#666; }
 
+    /* ===== Edit “woTable” (single-row) — same grid-card style as NEW ===== */
+    #woTable{
+      width: 100%;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      margin-top: 10px;
+    }
+    #woTable thead{ display:none; }
+
+    #woTable tbody tr{
+      display:grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px 12px;
+      padding: 12px;
+      margin: 10px 0;
+      border: 1px solid var(--stroke);
+      border-radius: 16px;
+      background: #ffffff;
+      box-shadow: 0 10px 26px rgba(16,24,40,0.06);
+    }
+    #woTable tbody td{
+      border:none;
+      padding:0;
+      display:flex;
+      flex-direction:column;
+      gap: 6px;
+      min-width: 0;
+    }
+    #woTable tbody td::before{
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 900;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      content: "";
+    }
+
+    /* Labels by column (must match the addRow() order below) */
+    #woTable tbody td:nth-child(1)::before{ content:"Work Order Number"; }
+    #woTable tbody td:nth-child(2)::before{ content:"District (Where Snow Removed)"; }
+    #woTable tbody td:nth-child(3)::before{ content:"Ward (Where Snow Removed)"; }
+    #woTable tbody td:nth-child(4)::before{ content:"TOA Area (Where Snow Removed)"; }
+    #woTable tbody td:nth-child(5)::before{ content:"Street"; }
+    #woTable tbody td:nth-child(6)::before{ content:"From Intersection"; }
+    #woTable tbody td:nth-child(7)::before{ content:"To Intersection"; }
+    #woTable tbody td:nth-child(8)::before{ content:"One Side / Both Sides Cleared?"; }
+    #woTable tbody td:nth-child(9)::before{ content:"Side of Road Cleared"; }
+    #woTable tbody td:nth-child(10)::before{ content:"Roadway"; }
+    #woTable tbody td:nth-child(11)::before{ content:"Sidewalk"; }
+    #woTable tbody td:nth-child(12)::before{ content:"Separated Cycling Infrastructure"; }
+    #woTable tbody td:nth-child(13)::before{ content:"Bridge"; }
+    #woTable tbody td:nth-child(14)::before{ content:"School Loading Zones"; }
+    #woTable tbody td:nth-child(15)::before{ content:"Equipment Method"; }
+    #woTable tbody td:nth-child(16)::before{ content:"# of Equipment (Dump Trucks)"; }
+    #woTable tbody td:nth-child(17)::before{ content:"Dump Truck Source (In-House/Contractor)"; }
+    #woTable tbody td:nth-child(18)::before{ content:"Snow Dump Site"; }
+    #woTable tbody td:nth-child(19)::before{ content:"# of Loads"; }
+    #woTable tbody td:nth-child(20)::before{ content:"Tonnes"; }
+    #woTable tbody td:nth-child(21)::before{ content:"Shift Start Date"; }
+    #woTable tbody td:nth-child(22)::before{ content:"Shift Start Time"; }
+    #woTable tbody td:nth-child(23)::before{ content:"Shift End Date"; }
+    #woTable tbody td:nth-child(24)::before{ content:"Shift End Time"; }
+    #woTable tbody td:nth-child(25)::before{ content:"Supervisor 1"; }
+    #woTable tbody td:nth-child(26)::before{ content:"Supervisor 2 (if relevant)"; }
+    #woTable tbody td:nth-child(27)::before{ content:"Supervisor 3 (if relevant)"; }
+    #woTable tbody td:nth-child(28)::before{ content:"Snow Removal by Contracted Crew or In-House?"; }
+    #woTable tbody td:nth-child(29)::before{ content:"Contractor: # of Crews"; }
+    #woTable tbody td:nth-child(30)::before{ content:"Contractor: Crew TOA Area Responsibility"; }
+    #woTable tbody td:nth-child(31)::before{ content:"Contractor: Crew Number"; }
+    #woTable tbody td:nth-child(32)::before{ content:"In-House: Staff Responsibility (Base Yard)"; }
+    #woTable tbody td:nth-child(33)::before{ content:"In-House: # of Staff"; }
+    #woTable tbody td:nth-child(34)::before{ content:"NOTES"; }
+
+    /* Spans / sizing */
+    #woTable tbody td:nth-child(1){ grid-column: span 2; }
+    #woTable tbody td:nth-child(5){ grid-column: span 2; }
+    #woTable tbody td:nth-child(15){ grid-column: span 2; }
+    #woTable tbody td:nth-child(30){ grid-column: span 2; }
+
+    #woTable tbody td:nth-child(34){ grid-column: 1 / -1; } /* NOTES full width */
+    #woTable tbody td:nth-child(5),
+    #woTable tbody td:nth-child(6),
+    #woTable tbody td:nth-child(7){
+      grid-column: span 2; /* Street + From/To bigger */
+    }
+
+    @media (max-width: 1100px){
+      #woTable tbody tr{ grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      #woTable tbody td:nth-child(34){ grid-column: 1 / -1; }
+    }
+    @media (max-width: 720px){
+      #woTable tbody tr{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #woTable tbody td:nth-child(34),
+      #woTable tbody td:nth-child(5),
+      #woTable tbody td:nth-child(6),
+      #woTable tbody td:nth-child(7){ grid-column: 1 / -1; }
+    }
+
+    .rowBtns{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+      margin-top: 10px;
+    }
+
+    #crossLists{ display:none; }
   </style>
-
-
 </head>
+
 <body>
   <div class="card">
     <div style="display:flex;align-items:center;gap:12px;">
@@ -4460,27 +5398,29 @@ EDIT_FORM_HTML = """
       <img src="{{ cot_logo_src }}" alt="City of Toronto"
            style="height:38px;width:auto;object-fit:contain;display:block;" />
       {% endif %}
-      <div>
+      <div style="flex:1;">
         <div style="font-weight:950;font-size:18px;letter-spacing:-0.02em;">Edit Intake Row</div>
         <div class="help" style="margin-top:2px;">Internal Operations Tool</div>
       </div>
     </div>
-    <div class="help">
+
+    <div class="help" style="margin-top:8px;">
       <a href="/new?bid={{ row.get('__batch_id','') }}">← Back to Batch</a> |
       <a href="/">Home</a> |
       <a href="/outputs/work_orders_map.html" target="_blank" rel="noopener noreferrer">Open Map</a>
     </div>
+
     <div class="help" style="margin-top:8px;">
       Submission ID: <code>{{ row.get('__submission_id','') }}</code> • Status: <code>{{ row.get('__status','') }}</code>
     </div>
+
     <div id="editTimerBox"
          style="margin-top:10px;display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--stroke);border-radius:14px;background:#f9fafb;">
       <div style="font-weight:900;font-size:13px;display:flex;align-items:center;gap:10px;">
         <span>Editing window:</span>
         <span id="editPendingTimer" style="font-size:16px;font-variant-numeric:tabular-nums;min-width:56px;display:inline-block;text-align:right;">--:--</span>
 
-        <button type="button" id="editExtendBtn"
-                style="display:none;padding:6px 10px;border-radius:999px;border:1px solid rgba(0,0,0,0.10);background:#6b7280;color:#fff;font-weight:900;font-size:12px;cursor:pointer;line-height:1;">
+        <button type="button" id="editExtendBtn" style="display:none;">
           Extend
         </button>
       </div>
@@ -4499,381 +5439,400 @@ EDIT_FORM_HTML = """
   {% endif %}
 
   <div class="card">
-    <form method="post">
-      <label>WO</label>
-      <input name="WO" required value="{{ row.get('WO','') }}"/>
+    <form method="post" autocomplete="off" id="editForm">
 
-      <label>Date</label>
-      <input name="Date__NL" required value="{{ row.get('Date\\n','') }}"/>
-
-      <label>District</label>
-      <select name="District__NL" id="districtSel" class="districtSel" required>
-        <option value="">-- choose --</option>
-        {% for d in districts %}
-        <option value="{{ d }}" {% if row.get('District\\n','') == d %}selected{% endif %}>{{ d }}</option>
-        {% endfor %}
-      </select>
-
-      <label>Ward</label>
-      <select name="Ward__NL" id="wardSel" class="wardSel" required>
-        <option value="">-- choose --</option>
-        {% for w in wards %}
-        <option value="{{ w }}" {% if row.get('Ward\\n','') == w %}selected{% endif %}>{{ w }}</option>
-        {% endfor %}
-      </select>
-
-      <label>Supervisor</label>
-      <input name="Supervisor__NL" list="supervisors_list" required value="{{ row.get('Supervisor\n','') }}"/>
-      <label>Shift</label>
-      <div class="timeRange">
-        <input type="time" id="shiftStart" name="ShiftStart__NL" required>
-        <span class="dash">-</span>
-        <input type="time" id="shiftEnd" name="ShiftEnd__NL" required>
-        <input type="hidden" id="shiftCombined" name="Shift__NL" value="{{ row.get('Shift\\n','') }}"/>
+      <div class="help" style="margin-bottom:8px;">
+        Edit fields below and click <b>Save changes</b>. (Only works while status is <b>PENDING</b>.)
       </div>
-      <div class="help">Saved format: <code>06:30AM - 06:30PM</code></div>
 
-      <label>Type</label>
-      <select name="Type__NL" required>
-        <option value="">-- choose --</option>
-        {% for t in types %}
-        <option value="{{ t }}" {% if row.get('Type (Road Class/ School, Bridge)\\n','') == t %}selected{% endif %}>{{ t }}</option>
+      <table id="woTable">
+        <thead><tr><th>edit</th></tr></thead>
+        <tbody id="woTbody"></tbody>
+      </table>
+
+      <datalist id="streets">
+        {% for st in streets %}
+        <option value="{{ st }}"></option>
         {% endfor %}
-      </select>
-      
-      <label>Dump Trucks</label>
-      <input name="# of Equipment (Dump Trucks)" value="{{ row.get('# of Equipment (Dump Trucks)','') }}"/>
+      </datalist>
 
-
-      <label>Dump Truck Provider</label>
-      <select name="Dump Truck Provider Contractor">
-        <option value="">--</option>
-        {% for x in dump_truck_providers %}
-        <option value="{{ x }}" {% if row.get('Dump Truck Provider Contractor','') == x %}selected{% endif %}>{{ x }}</option>
+      <datalist id="supervisors_list">
+        {% for s in supervisors %}
+        <option value="{{ s }}"></option>
         {% endfor %}
-      </select>
+      </datalist>
 
-      <label>Loads</label>
-      <input name="# of Loads" value="{{ row.get('# of Loads','') }}"/>
+      <div id="crossLists"></div>
 
-      <label>Tonnes</label>
-      <input name="Tonnes" value="{{ row.get('Tonnes','') }}"/>
-
-      <label>Side</label>
-      <select name="One Side/ Both Sides">
-        <option value="">--</option>
-        <option {% if row.get('One Side/ Both Sides')=='Both Sides' %}selected{% endif %}>Both Sides</option>
-        <option {% if row.get('One Side/ Both Sides')=='One Side' %}selected{% endif %}>One Side</option>
-      </select>
-
-      <label>Road Side</label>
-      <select name="Side of Road Cleared">
-        <option value="">--</option>
-        {% for s in ['North','South','East','West','East/West','North/South'] %}
-        <option {% if row.get('Side of Road Cleared')==s %}selected{% endif %}>{{ s }}</option>
-        {% endfor %}
-      </select>
-
-      <label>Snow Dump Site</label>
-      <select name="Snow Dumped Site">
-        <option value="">--</option>
-        {% for s in snow_dump_sites %}
-        <option {% if row.get('Snow Dumped Site')==s %}selected{% endif %}>{{ s }}</option>
-        {% endfor %}
-      </select>
-
-      <label>Comments</label>
-      <textarea name="Comments" rows="3">{{ row.get('Comments','') }}</textarea>
-
-      <label>Location</label>
-      <input class="locIn" id="locIn" name="Location" list="streets" required value="{{ row.get('Location','') }}"/>
-
-      <label>From</label>
-      <input class="fromIn" id="fromIn" name="From" value="{{ row.get('From ','') }}"/>
-
-      <label>To</label>
-      <input class="toIn" id="toIn" name="To" value="{{ row.get('To','') }}"/>
-
-      <button type="submit">Save changes</button>
-      <button type="submit" name="delete" value="1" class="ghost" style="margin-left:8px;">Delete (Pending only)</button>
+      <div class="rowBtns">
+        <button type="submit">Save changes</button>
+        <button type="submit" name="delete" value="1" class="ghost">Delete (Pending only)</button>
+      </div>
 
       <div class="help" style="margin-top:10px;">
-        Editing only works while status is <b>PENDING</b>. After it becomes <b>APPLIED</b>, it’s locked to protect the master DB.
+        After it becomes <b>APPLIED</b>, it’s locked to protect the master DB.
       </div>
     </form>
-
-    <datalist id="streets">
-      {% for st in streets %}
-      <option value="{{ st }}"></option>
-      {% endfor %}
-    </datalist>
-
-    <datalist id="supervisors_list">
-      {% for s in supervisors %}
-      <option value="{{ s }}"></option>
-      {% endfor %}
-    </datalist>
-
-    <div id="crossLists" style="display:none;"></div>
-
-    <script>
-    (function(){
-      // ---- District -> Ward dependency ----
-      var districtToWards = {{ district_to_wards_json | safe }};
-
-      var districtSel = document.getElementById('districtSel');
-      var wardSel = document.getElementById('wardSel');
-
-      function setWards(){
-        if(!districtSel || !wardSel) return;
-        var d = (districtSel.value || '').toString().trim().toUpperCase();
-        var wards = districtToWards[d] || [];
-        var prev = wardSel.value;
-
-        wardSel.innerHTML = '<option value="">-- choose --</option>';
-        wards.forEach(function(w){
-          var opt = document.createElement('option');
-          opt.value = w;
-          opt.textContent = w;
-          wardSel.appendChild(opt);
-        });
-
-        if (prev && wards.indexOf(prev) !== -1) wardSel.value = prev;
-        else if (wards.length) wardSel.value = wards[0];
-      }
-
-      if (districtSel && wardSel){
-        setWards(); // run once on load (keeps current ward if valid)
-        districtSel.addEventListener('change', setWards);
-      }
-
-      // ---- Location -> To/From dependent lists (same as NEW_FORM_HTML) ----
-      var crossListsHost = document.getElementById('crossLists');
-      var locIn = document.getElementById('locIn');
-      var toIn = document.getElementById('toIn');
-      var fromIn = document.getElementById('fromIn');
-
-      if (!crossListsHost || !locIn || !toIn || !fromIn) return;
-
-      function populateDatalist(dl, arr, excludeVal){
-        if (!dl) return;
-        var ex = (excludeVal || '').toString().trim().toUpperCase();
-        dl.innerHTML = '';
-        (arr || []).forEach(function(s){
-          var v = (s || '').toString();
-          if (!v) return;
-          if (ex && v.toUpperCase() === ex) return;
-          var opt = document.createElement('option');
-          opt.value = v;
-          dl.appendChild(opt);
-        });
-      }
-
-      async function fetchCrossStreets(locationVal){
-        var loc = (locationVal || '').toString().trim();
-        if (!loc) return { matched_location: "", cross_streets: [] };
-        try{
-          var resp = await fetch('/api/cross_streets?location=' + encodeURIComponent(loc));
-          if(!resp.ok) throw new Error('bad resp');
-          return await resp.json();
-        }catch(e){
-          return { matched_location: "", cross_streets: [] };
-        }
-      }
-
-      var dlTo = document.createElement('datalist');
-      dlTo.id = 'cross_to_edit';
-      dlTo.setAttribute('data-crosslist','1');
-      crossListsHost.appendChild(dlTo);
-      toIn.setAttribute('list', dlTo.id);
-
-      var dlFrom = document.createElement('datalist');
-      dlFrom.id = 'cross_from_edit';
-      dlFrom.setAttribute('data-crosslist','1');
-      crossListsHost.appendChild(dlFrom);
-      fromIn.setAttribute('list', dlFrom.id);
-
-      var cachedCross = [];
-
-      async function refreshCrossLists(){
-        var data = await fetchCrossStreets(locIn.value);
-        cachedCross = (data && data.cross_streets) ? data.cross_streets : [];
-        populateDatalist(dlTo, cachedCross, fromIn.value);
-        populateDatalist(dlFrom, cachedCross, toIn.value);
-      }
-
-      locIn.addEventListener('change', refreshCrossLists);
-      locIn.addEventListener('blur', refreshCrossLists);
-
-      toIn.addEventListener('change', function(){
-        populateDatalist(dlFrom, cachedCross, toIn.value);
-      });
-      fromIn.addEventListener('change', function(){
-        populateDatalist(dlTo, cachedCross, fromIn.value);
-      });
-
-      // initial populate for the existing record
-      refreshCrossLists();
-    })();
-    </script>
-    
-    <script>
-    (function(){
-      var bid = "{{ row.get('__batch_id','') }}";
-      if (!bid) return;
-
-      var timerEl = document.getElementById('editPendingTimer');
-      var extendBtn = document.getElementById('editExtendBtn');
-
-      function fmt(sec){
-        sec = Math.max(0, Math.floor(sec || 0));
-        var m = Math.floor(sec / 60);
-        var s = sec % 60;
-        return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
-      }
-
-      var remaining = 0;
-      var lastPollAt = 0;
-
-      function applyTimerClasses(rem){
-        if (!timerEl) return;
-        timerEl.classList.remove('timerWarn','timerFinal');
-        if (rem <= 10 && rem > 0) timerEl.classList.add('timerFinal');
-        else if (rem <= 20 && rem > 0) timerEl.classList.add('timerWarn');
-      }
-
-      function updateExtendButton(rem){
-        if (!extendBtn) return;
-        if (rem <= 20 && rem > 0){
-          extendBtn.style.display = 'inline-block';
-          extendBtn.disabled = false;
-        } else {
-          extendBtn.style.display = 'none';
-          extendBtn.disabled = true;
-        }
-      }
-
-      async function poll(){
-        var now = Date.now();
-        if (now - lastPollAt < 1500) return;
-        lastPollAt = now;
-
-        try{
-          var resp = await fetch('/api/pending_status?bid=' + encodeURIComponent(bid) + '&_t=' + now);
-          if(!resp.ok) return;
-          var j = await resp.json();
-          if (!j || !j.ok) return;
-
-          var serverNow = Number(j.server_now_epoch || 0);
-          var pendingUntil = Number(j.pending_until_epoch || 0);
-
-          remaining = Math.max(0, pendingUntil - serverNow);
-
-          if (timerEl){
-            timerEl.textContent = fmt(remaining);
-            applyTimerClasses(remaining);
-          }
-          updateExtendButton(remaining);
-        }catch(e){}
-      }
-
-      function tick(){
-        if (remaining > 0){
-          remaining -= 1;
-          if (timerEl){
-            timerEl.textContent = fmt(remaining);
-            applyTimerClasses(remaining);
-          }
-          updateExtendButton(remaining);
-        }
-        if ((Date.now() - lastPollAt) > 4000){
-          poll();
-        }
-        setTimeout(tick, 1000);
-      }
-
-      if (extendBtn){
-        extendBtn.addEventListener('click', async function(){
-          try{
-            extendBtn.disabled = true;
-            await fetch('/api/extend_pending', {
-              method: 'POST',
-              headers: {'Content-Type':'application/json'},
-              body: JSON.stringify({bid: bid})
-            });
-            await poll();
-          }catch(e){
-            await poll();
-          }
-        });
-      }
-
-      poll();
-      tick();
-    })();
-    </script>
   </div>
+
 <script>
 (function(){
-  function parseTokenTo24h(tok){
-    if(!tok) return null;
-    var s = String(tok).trim().toUpperCase().replace(/\\s+/g,'');
-    // HH:MM (24h)
-    var m = s.match(/^(\d{1,2}):(\d{2})$/);
-    if(m){
-      var hh = parseInt(m[1],10), mm = m[2];
-      if(hh>=0 && hh<=23) return String(hh).padStart(2,'0') + ':' + mm;
-      return null;
-    }
-    // H(:MM)?(AM|PM)
-    m = s.match(/^(\d{1,2})(?::(\d{2}))?(AM|PM)$/);
-    if(m){
-      var h12 = parseInt(m[1],10), mm2 = m[2] || '00', ap = m[3];
-      if(!(h12>=1 && h12<=12)) return null;
-      var hh24 = (h12 % 12) + (ap === 'PM' ? 12 : 0);
-      return String(hh24).padStart(2,'0') + ':' + mm2;
-    }
-    return null;
+  var districts = {{ districts_json | safe }};
+  var districtToWards = {{ district_to_wards_json | safe }};
+  var types = {{ types_json | safe }};
+  var dumpTruckProvidersOptions = {{ dump_truck_providers_html | tojson | safe }};
+  var snowDumpSitesOptions = {{ snow_dump_sites_html | tojson | safe }};
+  var STREET_ENDPOINTS = {{ street_endpoints_json | safe }};
+
+  var tbody = document.getElementById('woTbody');
+  var crossListsHost = document.getElementById('crossLists');
+
+  function escapeHtml(s){
+    return (s || '').toString()
+      .replaceAll('&','&amp;')
+      .replaceAll('<','&lt;')
+      .replaceAll('>','&gt;')
+      .replaceAll('"','&quot;')
+      .replaceAll("'","&#39;");
   }
 
-  function fmt12(v){
-    if(!v) return '';
-    var p = v.split(':'); if(p.length<2) return '';
-    var hh = parseInt(p[0],10), mm = p[1];
-    var ap = (hh >= 12) ? 'PM' : 'AM';
-    var h12 = hh % 12; if(h12 === 0) h12 = 12;
-    return String(h12).padStart(2,'0') + ':' + mm + ap;
+  function optList(arr){
+    return (arr || []).map(function(x){
+      return '<option value="' + escapeHtml(x) + '">' + escapeHtml(x) + '</option>';
+    }).join('');
   }
 
-  var start = document.getElementById('shiftStart');
-  var end = document.getElementById('shiftEnd');
-  var hidden = document.getElementById('shiftCombined');
-  if(!start || !end || !hidden) return;
-
-  function updateHidden(){
-    var a = fmt12(start.value);
-    var b = fmt12(end.value);
-    hidden.value = (a && b) ? (a + ' - ' + b) : '';
+  function districtSelectHtml(name, current){
+    var o = '<option value="">--</option>';
+    (districts||[]).forEach(function(d){
+      var sel = (String(current||'') === String(d)) ? ' selected' : '';
+      o += '<option value="' + escapeHtml(d) + '"' + sel + '>' + escapeHtml(d) + '</option>';
+    });
+    return '<select name="' + name + '" class="districtSel" required>' + o + '</select>';
   }
 
-  // Prefill from existing stored value like "06:30AM - 06:30PM"
-  var raw = (hidden.value || '').replace('–','-').replace('—','-');
-  var parts = raw.split('-').map(function(x){ return x.trim(); }).filter(Boolean);
-  if(parts.length >= 2){
-    var a24 = parseTokenTo24h(parts[0]);
-    var b24 = parseTokenTo24h(parts[1]);
-    if(a24) start.value = a24;
-    if(b24) end.value = b24;
-    updateHidden();
+  function wardSelectHtml(name){
+    return '<select name="' + name + '" class="wardSel" required><option value="">--</option></select>';
   }
 
-  start.addEventListener('change', updateHidden);
-  end.addEventListener('change', updateHidden);
+  function typeSelectHtml(name, current){
+    var o = '<option value="">--</option>' + optList(types);
+    var sel = '<select name="' + name + '" required>' + o + '</select>';
+    // set later by JS
+    return sel;
+  }
+
+  function yesNoSelect(name, current){
+    var cur = String(current||'');
+    return ''
+      + '<select name="' + name + '">'
+      +   '<option value=""></option>'
+      +   '<option' + (cur==='Yes'?' selected':'') + '>Yes</option>'
+      +   '<option' + (cur==='No'?' selected':'') + '>No</option>'
+      + '</select>';
+  }
+
+  function toaSelect(name, current){
+    var toaAreas = ['TOA 1-1', 'TOA 1-2', 'TOA 1-3', 'TOA 1-4', 'TOA 1-5',
+                    'TOA 2-1', 'TOA 2-2', 'TOA 2-3', 'TOA 2-4', 'TOA 2-5',
+                    'DVP-FGGE'];
+    var cur = String(current||'');
+    var options = '<option value="">--</option>';
+    toaAreas.forEach(function(t){
+      var sel = (cur === t) ? ' selected' : '';
+      options += '<option value="' + escapeHtml(t) + '"' + sel + '>' + escapeHtml(t) + '</option>';
+    });
+    return '<select name="' + name + '">' + options + '</select>';
+  }
+
+  function simpleSelect(name, optionsArr, current){
+    var cur = String(current||'');
+    var o = '<option value=""></option>';
+    (optionsArr||[]).forEach(function(x){
+      var sel = (cur===String(x)) ? ' selected' : '';
+      o += '<option' + sel + '>' + escapeHtml(x) + '</option>';
+    });
+    return '<select name="' + name + '">' + o + '</select>';
+  }
+
+  function endpointsForStreet(streetVal){
+    var k = (streetVal || '').toString().trim().toUpperCase();
+    if (!k) return [];
+    if (STREET_ENDPOINTS && STREET_ENDPOINTS[k]) return STREET_ENDPOINTS[k];
+    return [];
+  }
+
+  function populateDatalist(dl, arr, excludeVal){
+    if (!dl) return;
+    var ex = (excludeVal || '').toString().trim().toUpperCase();
+    dl.innerHTML = '';
+    (arr || []).forEach(function(s){
+      var v = (s || '').toString();
+      if (!v) return;
+      if (ex && v.toUpperCase() === ex) return;
+      var opt = document.createElement('option');
+      opt.value = v;
+      dl.appendChild(opt);
+    });
+  }
+
+  // --- Build ONE edit row in the same order as your Excel schema ---
+  var row = {{ row_json | safe }};
+
+  var tr = document.createElement('tr');
+  tr.innerHTML =
+    ''
+    + '<td><input name="Work Order Number" required value="' + escapeHtml(row["Work Order Number"]||"") + '"></td>'
+    + '<td>' + districtSelectHtml('District (Where Snow Removed)', row["District (Where Snow Removed)"]||"") + '</td>'
+    + '<td>' + wardSelectHtml('Ward (Where Snow Removed)') + '</td>'
+    + '<td>' + toaSelect('TOA Area (Where Snow Removed)', row["TOA Area (Where Snow Removed)"]||"") + '</td>'
+    + '<td><input class="streetIn" id="streetIn" name="Street" list="streets" required value="' + escapeHtml(row["Street"]||"") + '"></td>'
+    + '<td><input class="fromIn" id="fromIn" name="From Intersection" value="' + escapeHtml(row["From Intersection"]||"") + '"></td>'
+    + '<td><input class="toIn" id="toIn" name="To Intersection" value="' + escapeHtml(row["To Intersection"]||"") + '"></td>'
+    + '<td>' + simpleSelect('One Side / Both Sides Cleared?', ['Both Sides','One Side'], row["One Side / Both Sides Cleared?"]||"") + '</td>'
+    + '<td>' + simpleSelect('Side of Road Cleared', ['North','South','East','West','East/West','North/South'], row["Side of Road Cleared"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Infrastructure Type: Roadway', row["Infrastructure Type: Roadway"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Infrastructure Type: Sidewalk', row["Infrastructure Type: Sidewalk"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Infrastructure Type: Separated Cycling Infrastructure', row["Infrastructure Type: Separated Cycling Infrastructure"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Infrastructure Type: Bridge', row["Infrastructure Type: Bridge"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Infrastructure Type: School Loading Zones', row["Infrastructure Type: School Loading Zones"]||"") + '</td>'
+    + '<td><select name="Equipment Method" required><option value="">--</option>' + optList(types) + '</select></td>'
+    + '<td><input name="# of Equipment (Dump Trucks)" type="number" min="0" value="' + escapeHtml(row["# of Equipment (Dump Trucks)"]||"") + '"></td>'
+    + '<td>' + simpleSelect('Dump Truck Source (In-House/Contractor)', ['In-House','Contractor'], row["Dump Truck Source (In-House/Contractor)"]||"") + '</td>'
+    + '<td><select name="Snow Dump Site"><option value="">--</option>' + snowDumpSitesOptions + '</select></td>'
+    + '<td><input name="# of Loads" type="number" min="0" value="' + escapeHtml(row["# of Loads"]||"") + '"></td>'
+    + '<td><input name="Tonnes" type="number" step="0.01" min="0" value="' + escapeHtml(row["Tonnes"]||"") + '"></td>'
+    + '<td><input type="date" name="Shift Start Date" required value="' + escapeHtml(row["Shift Start Date"]||"") + '"></td>'
+    + '<td><input type="time" name="Shift Start Time" required value="' + escapeHtml(row["Shift Start Time"]||"") + '"></td>'
+    + '<td><input type="date" name="Shift End Date" value="' + escapeHtml(row["Shift End Date"]||"") + '"></td>'
+    + '<td><input type="time" name="Shift End Time" required value="' + escapeHtml(row["Shift End Time"]||"") + '"></td>'
+    + '<td><input name="Supervisor 1" list="supervisors_list" required value="' + escapeHtml(row["Supervisor 1"]||"") + '"></td>'
+    + '<td><input name="Supervisor 2 (if relevant)" value="' + escapeHtml(row["Supervisor 2 (if relevant)"]||"") + '"></td>'
+    + '<td><input name="Supervisor 3 (if relevant)" value="' + escapeHtml(row["Supervisor 3 (if relevant)"]||"") + '"></td>'
+    + '<td>' + simpleSelect('Snow Removal by Contracted Crew or In-House?', ['Contracted Crew','In-House'], row["Snow Removal by Contracted Crew or In-House?"]||"") + '</td>'
+    + '<td><input name="Contractor: # of Crews" value="' + escapeHtml(row["Contractor: # of Crews"]||"") + '"></td>'
+    + '<td><select name="Contractor: Crew TOA Area Responsibility"><option value="">--</option>' + dumpTruckProvidersOptions + '</select></td>'
+    + '<td><input name="Contractor: Crew Number" value="' + escapeHtml(row["Contractor: Crew Number"]||"") + '"></td>'
+    + '<td><input name="In-House: Staff Responsibility (Base Yard)" value="' + escapeHtml(row["In-House: Staff Responsibility (Base Yard)"]||"") + '"></td>'
+    + '<td><input name="In-House: # of Staff" type="number" min="0" value="' + escapeHtml(row["In-House: # of Staff"]||"") + '"></td>'
+    + '<td><textarea name="NOTES" rows="2" placeholder="Notes / comments (optional)">' + escapeHtml(row["NOTES"]||"") + '</textarea></td>';
+
+  tbody.appendChild(tr);
+
+  // set ward options based on district
+  var dsel = tr.querySelector('.districtSel');
+  var wsel = tr.querySelector('.wardSel');
+
+  function setWards(){
+    var dd = (dsel.value||'').toString().trim().toUpperCase();
+    var wards = districtToWards[dd] || [];
+    var prev = String(row["Ward (Where Snow Removed)"]||"");
+    wsel.innerHTML = '<option value="">--</option>';
+    wards.forEach(function(w){
+      var opt = document.createElement('option');
+      opt.value = w; opt.textContent = w;
+      wsel.appendChild(opt);
+    });
+    if (prev && wards.indexOf(prev) !== -1) wsel.value = prev;
+    else if (wards.length) wsel.value = wards[0];
+  }
+  dsel.addEventListener('change', setWards);
+  setWards();
+
+  // set equipment type selected
+  try{
+    var typeSel = tr.querySelector('select[name="Equipment Method"]');
+    if (typeSel) typeSel.value = String(row["Equipment Method"]||"");
+  }catch(e){}
+
+  // set snow dump site selected
+  try{
+    var snowSel = tr.querySelector('select[name="Snow Dump Site"]');
+    if (snowSel) snowSel.value = String(row["Snow Dump Site"]||"");
+  }catch(e){}
+
+  // set contractor responsibility selected
+  try{
+    var crewSel = tr.querySelector('select[name="Contractor: Crew TOA Area Responsibility"]');
+    if (crewSel) crewSel.value = String(row["Contractor: Crew TOA Area Responsibility"]||"");
+  }catch(e){}
+
+  // ---- Street -> From/To dependent lists ----
+  var streetIn = document.getElementById('streetIn');
+  var toIn = document.getElementById('toIn');
+  var fromIn = document.getElementById('fromIn');
+
+  var dlTo = document.createElement('datalist');
+  dlTo.id = 'cross_to_edit';
+  dlTo.setAttribute('data-crosslist','1');
+  crossListsHost.appendChild(dlTo);
+  toIn.setAttribute('list', dlTo.id);
+
+  var dlFrom = document.createElement('datalist');
+  dlFrom.id = 'cross_from_edit';
+  dlFrom.setAttribute('data-crosslist','1');
+  crossListsHost.appendChild(dlFrom);
+  fromIn.setAttribute('list', dlFrom.id);
+
+  var cachedCross = [];
+
+  function refreshCrossLists(){
+    cachedCross = endpointsForStreet(streetIn.value);
+    populateDatalist(dlTo, cachedCross, fromIn.value);
+    populateDatalist(dlFrom, cachedCross, toIn.value);
+  }
+
+  streetIn.addEventListener('change', refreshCrossLists);
+  streetIn.addEventListener('blur', refreshCrossLists);
+
+  toIn.addEventListener('change', function(){ populateDatalist(dlFrom, cachedCross, toIn.value); });
+  fromIn.addEventListener('change', function(){ populateDatalist(dlTo, cachedCross, fromIn.value); });
+
+  refreshCrossLists();
 })();
 </script>
+
+<script>
+(function(){
+  // ---- Edit pending timer + extend ----
+  var bid = "{{ row.get('__batch_id','') }}";
+  if (!bid) return;
+
+  var timerEl = document.getElementById('editPendingTimer');
+  var extendBtn = document.getElementById('editExtendBtn');
+
+  function fmt(sec){
+    sec = Math.max(0, Math.floor(sec || 0));
+    var m = Math.floor(sec / 60);
+    var s = sec % 60;
+    return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+  }
+
+  function applyTimerClasses(rem){
+    if (!timerEl) return;
+    timerEl.classList.remove('timerWarn','timerFinal');
+    if (rem <= 10 && rem > 0) timerEl.classList.add('timerFinal');
+    else if (rem <= 20 && rem > 0) timerEl.classList.add('timerWarn');
+  }
+
+  function updateExtendButton(rem){
+    if (!extendBtn) return;
+    if (rem <= 20 && rem > 0){
+      extendBtn.style.display = 'inline-block';
+      extendBtn.disabled = false;
+    } else {
+      extendBtn.style.display = 'none';
+      extendBtn.disabled = true;
+    }
+  }
+
+  var remaining = 0;
+  var lastPollAt = 0;
+
+  async function poll(){
+    var now = Date.now();
+    if (now - lastPollAt < 1500) return;
+    lastPollAt = now;
+
+    try{
+      var resp = await fetch('/api/pending_status?bid=' + encodeURIComponent(bid) + '&_t=' + now);
+      if(!resp.ok) return;
+      var j = await resp.json();
+      if (!j || !j.ok) return;
+
+      var serverNow = Number(j.server_now_epoch || 0);
+      var pendingUntil = Number(j.pending_until_epoch || 0);
+
+      remaining = Math.max(0, pendingUntil - serverNow);
+
+      if (timerEl){
+        timerEl.textContent = fmt(remaining);
+        applyTimerClasses(remaining);
+      }
+      updateExtendButton(remaining);
+    }catch(e){}
+  }
+
+  function tick(){
+    if (remaining > 0){
+      remaining -= 1;
+      if (timerEl){
+        timerEl.textContent = fmt(remaining);
+        applyTimerClasses(remaining);
+      }
+      updateExtendButton(remaining);
+    }
+    if ((Date.now() - lastPollAt) > 4000){
+      poll();
+    }
+    setTimeout(tick, 1000);
+  }
+
+  if (extendBtn){
+    extendBtn.addEventListener('click', async function(){
+      try{
+        extendBtn.disabled = true;
+        await fetch('/api/extend_pending', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({bid: bid})
+        });
+        await poll();
+      }catch(e){
+        await poll();
+      }
+    });
+  }
+
+  poll();
+  tick();
+})();
+</script>
+
 </body>
 </html>
 """
+
+
+def normalize_wo_id(x: str) -> str:
+    """
+    Stable normalization for Work Order Number / WO fields.
+    Used by intake logic / status checks.
+    """
+    s = str(x or "").strip()
+    if not s:
+        return ""
+    # keep digits if it's numeric-like, but don't crash on alphas
+    s2 = re.sub(r"\s+", "", s)
+    return s2
+
+
+def enqueue_build(reason: str = ""):
+    """
+    Minimal rebuild trigger used by edit/new flows.
+    Fixes: NameError: enqueue_build not defined
+    """
+    try:
+        with FILE_LOCK:
+            stats = build_everything()
+        # refresh picklists
+        try:
+            global latest_allowed_sets, latest_centre_streets, latest_street_to_cross, latest_build_stats
+            latest_allowed_sets = recompute_allowed_sets_from_master()
+            latest_centre_streets = stats.get("centre_streets", [])
+            latest_street_to_cross = stats.get("street_to_cross", {})
+            latest_build_stats = {
+                "status": "ready",
+                "last_build": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                **{k: v for k, v in stats.items() if k != "centre_streets"},
+            }
+        except Exception:
+            pass
+
+        _emit_updated_event("build", items=[{"reason": reason or "manual"}])
+    except Exception as e:
+        log(f"enqueue_build error: {e}")
+
 
 @app.get("/")
 def home():
@@ -4935,6 +5894,8 @@ def new_form():
             apply_in_seconds = 0
 
 
+    street_endpoints = get_street_endpoints_index()
+
     return render_template_string(
         NEW_FORM_HTML,
         cot_logo_src=COT_LOGO_DATA_URI,
@@ -4946,10 +5907,10 @@ def new_form():
         inserted_count=len([r for r in batch if r.get("__status","").strip()]),
         intake_poll_seconds=INTAKE_POLL_SECONDS,
         districts=DISTRICTS,
-        supervisors=latest_allowed_sets.get("Supervisor\n", []),
-        shifts=latest_allowed_sets.get("Shift\n", []),
-        types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
-        streets=latest_centre_streets,
+        supervisors=latest_allowed_sets.get("Supervisor 1", []),
+        shifts=(STRICT_SHIFTS[:] if STRICT_SHIFTS else []),
+        types=(STRICT_TYPES[:] if STRICT_TYPES else []),
+        streets=(sorted(street_endpoints.keys(), key=lambda x: x.casefold()) if street_endpoints else latest_centre_streets),
         dump_truck_providers_html="".join(
             f"<option>{html.escape(x)}</option>" for x in DUMP_TRUCK_PROVIDERS
         ),
@@ -4957,8 +5918,9 @@ def new_form():
             f"<option>{html.escape(x)}</option>" for x in SNOW_DUMP_SITES
         ),        
         districts_json=json.dumps(DISTRICTS),
-        shifts_json=json.dumps(latest_allowed_sets.get("Shift\n", [])),
-        types_json=json.dumps(latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", [])),
+        shifts_json=json.dumps((STRICT_SHIFTS[:] if STRICT_SHIFTS else [])),
+        types_json=json.dumps((STRICT_TYPES[:] if STRICT_TYPES else [])),
+        street_endpoints_json=json.dumps(street_endpoints, ensure_ascii=False),
         district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
     )
 
@@ -4972,47 +5934,135 @@ def new_submit():
 
     form = request.form.to_dict()
 
+    log("NEW_SUBMIT keys sample: " + ", ".join(list(request.form.keys())[:30]))
+
+
     # Parse rows WO_0..WO_n
+        # -------------------------
+    # Parse rows robustly (do NOT assume contiguous 0..N)
+    # -------------------------
     rows = []
-    idx = 0
-    while True:
-        key = f"WO_{idx}"
-        if key not in form:
-            break
 
-        values = {master_key: "" for master_key in MASTER_COLUMNS}
-        # map indexed form fields -> master columns
-        values["WO"] = form.get(f"WO_{idx}", "")
-        values["District\n"] = form.get(f"District__NL_{idx}", "")
-        values["Ward\n"] = form.get(f"Ward__NL_{idx}", "")
-        values["Date\n"] = form.get(f"Date__NL_{idx}", "")
-        values["Shift\n"] = normalize_shift_time_range(
-            form.get(f"Shift__NL_{idx}", ""),
-            form.get(f"ShiftStart__NL_{idx}", ""),
-            form.get(f"ShiftEnd__NL_{idx}", ""),
-        )
-        values["Supervisor\n"] = form.get(f"Supervisor__NL_{idx}", "")
-        values["Location"] = form.get(f"Location_{idx}", "")
-        values["From "] = form.get(f"From_{idx}", "")
-        values["To"] = form.get(f"To_{idx}", "")
-        values["Type (Road Class/ School, Bridge)\n"] = form.get(f"Type__NL_{idx}", "")
-        values["# of Equipment (Dump Trucks)"] = form.get(f"# of Equipment (Dump Trucks)_{idx}", "")
-        values["Dump Truck Provider Contractor"] = form.get(f"Dump Truck Provider Contractor_{idx}", "")
-        values["# of Loads"] = form.get(f"# of Loads_{idx}", "")
-        values["Tonnes"] = form.get(f"Tonnes_{idx}", "")
-        values["One Side/ Both Sides"] = form.get(f"One Side/ Both Sides_{idx}", "")
-        values["Side of Road Cleared"] = form.get(f"Side of Road Cleared_{idx}", "")
-        values["Snow Dumped Site"] = form.get(f"Snow Dumped Site_{idx}", "")
-        values["Comments"] = form.get(f"Comments_{idx}", "")
+    # collect all indices present in the submission for Work Order Number_{i}
+    idxs = []
+    for k in form.keys():
+        m = re.match(r"^Work Order Number_(\d+)$", str(k))
+        if m:
+            try:
+                idxs.append(int(m.group(1)))
+            except Exception:
+                pass
+    idxs = sorted(set(idxs))
 
+    for idx in idxs:
+        values = {k: "" for k in MASTER_COLUMNS}
 
-        # Skip fully empty accidental rows (but keep strict required)
-        if normalize_blank(values.get("WO")) or normalize_blank(values.get("Location")):
-            rows.append(values)
+        # helper getter
+        def g(field_name: str) -> str:
+            return (form.get(f"{field_name}_{idx}", "") or "").strip()
+
+        # 1
+        values["Work Order Number"] = g("Work Order Number")
+
+        # 2-4
+        values["District (Where Snow Removed)"] = g("District (Where Snow Removed)")
+        values["Ward (Where Snow Removed)"] = g("Ward (Where Snow Removed)")
+        values["TOA Area (Where Snow Removed)"] = g("TOA Area (Where Snow Removed)")
+
+        # 5-7
+        values["Street"] = g("Street")
+        values["From Intersection"] = g("From Intersection")
+        values["To Intersection"] = g("To Intersection")
+
+        # 8-9
+        values["One Side / Both Sides Cleared?"] = g("One Side / Both Sides Cleared?")
+        values["Side of Road Cleared"] = g("Side of Road Cleared")
+
+        # 10-14 Yes/No fields - FIX: Form sends "Roadway", but master expects "Infrastructure Type: Roadway"
+        values["Infrastructure Type: Roadway"] = g("Roadway")
+        values["Infrastructure Type: Sidewalk"] = g("Sidewalk")
+        values["Infrastructure Type: Separated Cycling Infrastructure"] = g("Separated Cycling Infrastructure")
+        values["Infrastructure Type: Bridge"] = g("Bridge")
+        values["Infrastructure Type: School Loading Zones"] = g("School Loading Zones")
+
+        # 15-20
+        values["Equipment Method"] = g("Equipment Method")
+        values["# of Equipment (Dump Trucks)"] = g("# of Equipment (Dump Trucks)")
+        values["Dump Truck Source (In-House/Contractor)"] = g("Dump Truck Source (In-House/Contractor)")
+        values["Snow Dump Site"] = g("Snow Dump Site")
+        values["# of Loads"] = g("# of Loads")
+        values["Tonnes"] = g("Tonnes")
+
+        # 21-24 Shift
+        values["Shift Start Date"] = format_date_from_picker(g("Shift Start Date"))
+        values["Shift Start Time"] = g("Shift Start Time")
+
+        _end_date = format_date_from_picker(g("Shift End Date"))
+        values["Shift End Date"] = _end_date if _end_date else values["Shift Start Date"]
+        values["Shift End Time"] = g("Shift End Time")
+
+        # If end time is "earlier" than start and end date was blank, assume next day
+        try:
+            from datetime import datetime, timedelta
+            sd = values["Shift Start Date"]
+            ed = values["Shift End Date"]
+            st = values["Shift Start Time"]
+            et = values["Shift End Time"]
+            if sd and st and et:
+                ds = datetime.strptime(sd, "%Y-%m-%d")
+                dt_start = datetime.combine(ds.date(), datetime.strptime(st, "%H:%M").time())
+                de_base = datetime.strptime(ed, "%Y-%m-%d") if ed else ds
+                dt_end = datetime.combine(de_base.date(), datetime.strptime(et, "%H:%M").time())
+                if (not _end_date) and dt_end < dt_start:
+                    dt_end += timedelta(days=1)
+                    values["Shift End Date"] = dt_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+        # 25 Hours Worked (server truth)
+        try:
+            from datetime import datetime
+            sd = values["Shift Start Date"]
+            ed = values["Shift End Date"] or sd
+            st = values["Shift Start Time"]
+            et = values["Shift End Time"]
+            if sd and ed and st and et:
+                dt1 = datetime.fromisoformat(sd + " " + st + ":00")
+                dt2 = datetime.fromisoformat(ed + " " + et + ":00")
+                hours = max(0.0, (dt2 - dt1).total_seconds() / 3600.0)
+                values["Hours Worked"] = f"{hours:.2f}"
+        except Exception:
+            values["Hours Worked"] = ""
+
+        # 26 Data entry timestamp
+        values["Time and Date of Data Entry Input"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 27-29 Supervisors
+        values["Supervisor 1"] = g("Supervisor 1")
+        values["Supervisor 2 (if relevant)"] = g("Supervisor 2 (if relevant)")
+        values["Supervisor 3 (if relevant)"] = g("Supervisor 3 (if relevant)")
+
+        # 30-35 Contractor/In-house fields
+        values["Snow Removal by Contracted Crew or In-House?"] = g("Snow Removal by Contracted Crew or In-House?")
+        values["Contractor: # of Crews"] = g("Contractor: # of Crews")
+        values["Contractor: Crew TOA Area Responsibility"] = g("Contractor: Crew TOA Area Responsibility")
+        values["Contractor: Crew Number"] = g("Contractor: Crew Number")
+        values["In-House: Staff Responsibility (Base Yard)"] = g("In-House: Staff Responsibility (Base Yard)")
+        values["In-House: # of Staff"] = g("In-House: # of Staff")
+
+        # 36 NOTES
+        values["NOTES"] = g("NOTES")
+
+        # ✅ Skip accidental fully-empty rows (THIS was backwards in your earlier logic)
+        if (not normalize_blank(values.get("Work Order Number"))) and (not normalize_blank(values.get("Street"))):
+            continue
+
+        rows.append(values)
 
         idx += 1
 
     if not rows:
+        street_endpoints = get_street_endpoints_index()
         return render_template_string(
             NEW_FORM_HTML,
             cot_logo_src=COT_LOGO_DATA_URI,
@@ -5021,21 +6071,24 @@ def new_submit():
             batch_id="",
             inserted_count=0,
             intake_poll_seconds=INTAKE_POLL_SECONDS,
-            districts=DISTRICTS,            supervisors=latest_allowed_sets.get("Supervisor\n", []),
-            shifts=latest_allowed_sets.get("Shift\n", []),
-            types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
-            streets=latest_centre_streets,
+            districts=DISTRICTS,            supervisors=latest_allowed_sets.get("Supervisor 1", []),
+            shifts=(STRICT_SHIFTS[:] if STRICT_SHIFTS else []),
+            types=(STRICT_TYPES[:] if STRICT_TYPES else []),
+            streets=(sorted(street_endpoints.keys(), key=lambda x: x.casefold()) if street_endpoints else latest_centre_streets),
             dump_truck_providers_html="".join(f"<option>{html.escape(x)}</option>" for x in DUMP_TRUCK_PROVIDERS),
             snow_dump_sites_html="".join(f"<option>{html.escape(x)}</option>" for x in SNOW_DUMP_SITES),                
             districts_json=json.dumps(DISTRICTS),            
-            shifts_json=json.dumps(latest_allowed_sets.get("Shift\n", [])),
-            types_json=json.dumps(latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", [])),
+            shifts_json=json.dumps((STRICT_SHIFTS[:] if STRICT_SHIFTS else [])),
+            types_json=json.dumps((STRICT_TYPES[:] if STRICT_TYPES else [])),
+            street_endpoints_json=json.dumps(street_endpoints, ensure_ascii=False),
             district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
         )
 
+    street_endpoints = get_street_endpoints_index()
+
     streets_set = set(
         s.upper().strip()
-        for s in latest_centre_streets
+        for s in (street_endpoints.keys() if street_endpoints else latest_centre_streets)
         if isinstance(s, str) and s.strip()
     )
 
@@ -5045,10 +6098,10 @@ def new_submit():
     # Validate each row independently
     for i, values in enumerate(rows, start=1):
         allowed_sets = dict(allowed_base)
-        dval = values.get("District\n", "")
-        allowed_sets["Ward\n"] = wards_for_district(dval)
+        dval = values.get("District (Where Snow Removed)", "")
+        allowed_sets["Ward (Where Snow Removed)"] = wards_for_district(dval)
 
-        errs = validate_submission(values, allowed_sets, streets_set)
+        errs = validate_submission(values, allowed_sets, streets_set, street_endpoints)
         for e in errs:
             all_errors.append(f"Row {i}: {e}")
 
@@ -5057,27 +6110,30 @@ def new_submit():
         prefill_rows = []
 
         for v in rows:
+            # JS expects these keys (WO/District/Ward/Date/Shift/Supervisor/Street/FromIntersection/ToIntersection...) for repopulating the row grid.
+            sh = normalize_shift_time_range("", v.get("Shift Start Time", ""), v.get("Shift End Time", ""))
             prefill_rows.append({
-                "WO": v.get("WO", ""),
-                "District": v.get("District\n", ""),
-                "Ward": v.get("Ward\n", ""),
-                "Date": v.get("Date\n", ""),
-                "Shift": v.get("Shift\n", ""),
-                "Supervisor": v.get("Supervisor\n", ""),
-                "Location": v.get("Location", ""),
-                "From": v.get("From ", ""),
-                "To": v.get("To", ""),
-                "Type": v.get("Type (Road Class/ School, Bridge)\n", ""),
+                "WO": v.get("Work Order Number", ""),
+                "District": v.get("District (Where Snow Removed)", ""),
+                "Ward": v.get("Ward (Where Snow Removed)", ""),
+                "Date": v.get("Shift Start Date", ""),
+                "Shift": sh,
+                "Supervisor": v.get("Supervisor 1", ""),
+                "Street": v.get("Street", ""),
+                "FromIntersection": v.get("From Intersection", ""),
+                "ToIntersection": v.get("To Intersection", ""),
+                "Type": v.get("Equipment Method", ""),
                 "DumpTrucks": v.get("# of Equipment (Dump Trucks)", ""),
-                "Provider": v.get("Dump Truck Provider Contractor", ""),
+                "Provider": "",  # stored in NOTES if provided
                 "Loads": v.get("# of Loads", ""),
                 "Tonnes": v.get("Tonnes", ""),
-                "SideBoth": v.get("One Side/ Both Sides", ""),
+                "SideBoth": v.get("One Side / Both Sides Cleared?", ""),
                 "RoadSide": v.get("Side of Road Cleared", ""),
-                "SnowSite": v.get("Snow Dumped Site", ""),
-                "Comments": v.get("Comments", ""),
+                "SnowSite": v.get("Snow Dump Site", ""),
+                "Comments": v.get("NOTES", ""),
             })
 
+        street_endpoints = get_street_endpoints_index()
         return render_template_string(
             NEW_FORM_HTML,
             cot_logo_src=COT_LOGO_DATA_URI,
@@ -5087,15 +6143,16 @@ def new_submit():
             inserted_count=0,
             intake_poll_seconds=INTAKE_POLL_SECONDS,
             districts=DISTRICTS,
-            supervisors=latest_allowed_sets.get("Supervisor\n", []),
-            shifts=latest_allowed_sets.get("Shift\n", []),
-            types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
-            streets=latest_centre_streets,
+            supervisors=latest_allowed_sets.get("Supervisor 1", []),
+            shifts=(STRICT_SHIFTS[:] if STRICT_SHIFTS else []),
+            types=(STRICT_TYPES[:] if STRICT_TYPES else []),
+            streets=(sorted(street_endpoints.keys(), key=lambda x: x.casefold()) if street_endpoints else latest_centre_streets),
             dump_truck_providers_html="".join(f"<option>{html.escape(x)}</option>" for x in DUMP_TRUCK_PROVIDERS),
             snow_dump_sites_html="".join(f"<option>{html.escape(x)}</option>" for x in SNOW_DUMP_SITES),
             districts_json=json.dumps(DISTRICTS),            
-            shifts_json=json.dumps(latest_allowed_sets.get("Shift\n", [])),
-            types_json=json.dumps(latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", [])),
+            shifts_json=json.dumps((STRICT_SHIFTS[:] if STRICT_SHIFTS else [])),
+            types_json=json.dumps((STRICT_TYPES[:] if STRICT_TYPES else [])),
+            street_endpoints_json=json.dumps(street_endpoints, ensure_ascii=False),
             prefill_rows_json=json.dumps(prefill_rows),
             district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
         )
@@ -5109,12 +6166,17 @@ def new_submit():
 
 @app.get("/api/cross_streets")
 def api_cross_streets():
-    """Return cross-street suggestions that intersect a given Location street."""
+    """Return cross-street suggestions for a given Street.
+
+    Query params:
+      - street (preferred)
+      - location (legacy alias)
+    """
     auth_resp = require_auth_or_401()
     if auth_resp:
         return auth_resp
 
-    loc_raw = (request.args.get("location") or "").strip()
+    street_raw = (request.args.get("street") or request.args.get("location") or "").strip()
 
     def _ui_norm(s: str) -> str:
         s = (s or "").upper().strip()
@@ -5122,43 +6184,42 @@ def api_cross_streets():
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    loc_key = _ui_norm(loc_raw)
+    street_key = _ui_norm(street_raw)
 
     streets = latest_centre_streets or []
     street_set = set(streets)
 
     matched = ""
-    if loc_key in street_set:
-        matched = loc_key
+    if street_key in street_set:
+        matched = street_key
     else:
-        # Cheap best-effort matching
         # 1) substring
         for st in streets:
-            if loc_key and loc_key in st:
+            if street_key and street_key in st:
                 matched = st
                 break
         # 2) difflib fallback
-        if not matched and loc_key:
+        if not matched and street_key:
             try:
-                close = difflib.get_close_matches(loc_key, streets, n=1, cutoff=0.72)
+                close = difflib.get_close_matches(street_key, streets, n=1, cutoff=0.72)
                 if close:
                     matched = close[0]
             except Exception:
                 pass
 
     cross = list(latest_street_to_cross.get(matched, []) or [])
-    return Response(
-        json.dumps(
-            {
-                "input_location": loc_raw,
-                "matched_location": matched,
-                "count": len(cross),
-                "cross_streets": cross,
-            },
-            ensure_ascii=False,
-        ),
-        mimetype="application/json",
-    )
+    payload = {
+        "input_street": street_raw,
+        "matched_street": matched,
+        "count": len(cross),
+        "cross_streets": cross,
+
+        # Legacy keys (older JS expects these)
+        "input_location": street_raw,
+        "matched_location": matched,
+    }
+
+    return Response(json.dumps(payload, ensure_ascii=False), mimetype="application/json")
 
 @app.get("/api/pending_status")
 def api_pending_status():
@@ -5260,7 +6321,12 @@ def api_extend_pending():
 
         now_epoch = time.time()
         if pending.empty:
-            return Response(json.dumps({"ok": False, "error": "no pending rows"}), mimetype="application/json", status=409)
+            return Response(
+                json.dumps({"ok": True, "message": "no_pending_noop"}),
+                mimetype="application/json",
+                status=200,
+            )
+
 
         pu = pd.to_numeric(pending.get("__pending_until_epoch", ""), errors="coerce")
 
@@ -5284,6 +6350,9 @@ def api_extend_pending():
         new_until = float(now_epoch) + float(PENDING_GRACE_SECONDS)
 
         mask = df["__batch_id"].astype(str).eq(bid) & df["__status"].astype(str).str.upper().eq("PENDING")
+        if "__pending_until_epoch" not in df.columns:
+            df["__pending_until_epoch"] = ""
+        df["__pending_until_epoch"] = df["__pending_until_epoch"].astype(str)  # ensure column is str type
         df.loc[mask, "__pending_until_epoch"] = str(int(new_until))
         df.to_csv(INTAKE_PATH, index=False, encoding="utf-8")
 
@@ -5308,26 +6377,46 @@ def edit_form(sid):
     if auth_resp:
         return auth_resp
 
+    street_endpoints = get_street_endpoints_index()
+
     row = get_intake_row_by_submission_id(sid)
     if not row:
         return Response("Not found", 404)
 
+    # Derive provider + comments from NOTES (provider is stored as a tagged line)
+    raw_notes = str(row.get("NOTES", "") or "").strip()
+    provider_val = ""
+    notes_val = raw_notes
+    tag = "Dump Truck Provider Contractor:"
+    if tag in raw_notes:
+        parts = raw_notes.split(tag, 1)
+        notes_val = parts[0].rstrip() if parts else raw_notes
+        provider_val = parts[1].strip() if len(parts) > 1 else ""
+
+    district_val = row.get("District (Where Snow Removed)", "")
+    wards = wards_for_district(district_val) or latest_allowed_sets.get("Ward (Where Snow Removed)", [])
+    row_json = {k: str(row.get(k, "") or "") for k in MASTER_COLUMNS}
+
     return render_template_string(
         EDIT_FORM_HTML,
-        cot_logo_src=COT_LOGO_DATA_URI,        
+        cot_logo_src=COT_LOGO_DATA_URI,
         row=row,
+        row_json=json.dumps(row_json, ensure_ascii=False),
         ok=False,
         errors=[],
         districts=DISTRICTS,
-        wards=wards_for_district(row.get("District\n", "")) or latest_allowed_sets.get("Ward\n", []),
-        supervisors=latest_allowed_sets.get("Supervisor\n", []),
-        streets=latest_centre_streets,
+        districts_json=json.dumps(DISTRICTS),
+        wards=wards,
+        supervisors=latest_allowed_sets.get("Supervisor 1", []),
+        streets=(sorted(street_endpoints.keys(), key=lambda x: x.casefold()) if street_endpoints else latest_centre_streets),
         district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
-        shifts=latest_allowed_sets.get("Shift\n", []),
-        types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
-        dump_truck_providers=DUMP_TRUCK_PROVIDERS,
-        snow_dump_sites=SNOW_DUMP_SITES,        
+        street_endpoints_json=json.dumps(street_endpoints, ensure_ascii=False),
+        types=(STRICT_TYPES[:] if STRICT_TYPES else []),
+        types_json=json.dumps((STRICT_TYPES[:] if STRICT_TYPES else [])),
+        dump_truck_providers_html="".join(f"<option>{html.escape(x)}</option>" for x in DUMP_TRUCK_PROVIDERS),
+        snow_dump_sites_html="".join(f"<option>{html.escape(x)}</option>" for x in SNOW_DUMP_SITES),
     )
+
 
 
 @app.post("/edit/<sid>")
@@ -5336,95 +6425,97 @@ def edit_submit(sid):
     if auth_resp:
         return auth_resp
 
-    row = get_intake_row_by_submission_id(sid)
-    if not row:
-        return Response("Not found", 404)
-
-    # Soft delete
-    if (request.form.get("delete") or "").strip() == "1":
-        ok = delete_intake_row(sid)
-        row2 = get_intake_row_by_submission_id(sid)
-        return render_template_string(
-            EDIT_FORM_HTML,
-            cot_logo_src=COT_LOGO_DATA_URI,
-            row=row2 or row,
-            ok=ok,
-            errors=[] if ok else ["Cannot delete (only PENDING rows can be deleted)."],
-            districts=DISTRICTS,
-            wards=wards_for_district((row2 or row).get("District\n", "")) or latest_allowed_sets.get("Ward\n", []),
-            supervisors=latest_allowed_sets.get("Supervisor\n", []),
-            streets=latest_centre_streets,
-            district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
-            shifts=latest_allowed_sets.get("Shift\n", []),
-            types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
-            dump_truck_providers=DUMP_TRUCK_PROVIDERS,
-            snow_dump_sites=SNOW_DUMP_SITES,
-        )
+    # Load intake rows and locate this submission
+    ensure_intake_file()
+    intake = pd.read_csv(INTAKE_PATH, dtype=str).fillna("")
+    m = intake[intake.get("__submission_id", "") == str(sid)] if "__submission_id" in intake.columns else intake.iloc[0:0]
 
     form = request.form.to_dict()
 
-    values = {master_key: "" for master_key in MASTER_COLUMNS}
-    for form_key, master_key in FORM_TO_MASTER.items():
-        values[master_key] = form.get(form_key, "")
+    # Build a master-schema row from form values (form now uses exact Excel header names)
+    values = {k: "" for k in MASTER_COLUMNS}
 
-    # Date: allow both picker format and already-formatted
-    values["Date\n"] = format_date_from_picker(values.get("Date\n", ""))
-    values["# of Equipment (Dump Trucks)"] = form.get("# of Equipment (Dump Trucks)", "")
-    values["Dump Truck Provider Contractor"] = form.get("Dump Truck Provider Contractor", "")
-    values["# of Loads"] = form.get("# of Loads", "")
-    values["Tonnes"] = form.get("Tonnes", "")
-    values["One Side/ Both Sides"] = form.get("One Side/ Both Sides", "")
-    values["Side of Road Cleared"] = form.get("Side of Road Cleared", "")
-    values["Snow Dumped Site"] = form.get("Snow Dumped Site", "")
-    values["Comments"] = form.get("Comments", "")
+    # Copy any direct master keys from the form
+    for k in MASTER_COLUMNS:
+        if k in form:
+            values[k] = form.get(k, "")
 
+    # Normalize date format (picker gives YYYY-MM-DD) and fill end-date safely
+    try:
+        _date_picker = values.get("Shift Start Date", "")
+        values["Shift Start Date"] = format_date_from_picker(_date_picker) if _date_picker else values.get("Shift Start Date", "")
+        if not values.get("Shift End Date"):
+            values["Shift End Date"] = values.get("Shift Start Date", "")
+    except Exception:
+        pass
 
-    streets_set = set(
-        s.upper().strip()
-        for s in latest_centre_streets
-        if isinstance(s, str) and s.strip()
-    )
+    # Auto compute Shift End Date if crosses midnight
+    try:
+        sd = values.get("Shift Start Date", "")
+        st = values.get("Shift Start Time", "")
+        et = values.get("Shift End Time", "")
+        if sd and st and et:
+            from datetime import datetime, timedelta
+            ds = datetime.strptime(sd, "%Y-%m-%d")
+            t1 = datetime.strptime(st, "%H:%M").time()
+            t2 = datetime.strptime(et, "%H:%M").time()
+            dt_start = datetime.combine(ds.date(), t1)
+            dt_end = datetime.combine(ds.date(), t2)
+            if dt_end < dt_start:
+                dt_end += timedelta(days=1)
+            values["Shift End Date"] = dt_end.strftime("%Y-%m-%d")
+    except Exception:
+        pass
 
-    allowed_sets = dict(latest_allowed_sets or {})
-    dval = values.get("District\n", "")
-    allowed_sets["Ward\n"] = wards_for_district(dval)
+    # Intersection IDs (best-effort)
+    try:
+        _ref_street_to_cross, _pair_to_id = get_intersection_reference()
+        _s = normalize_street_name(values.get("Street", ""))
+        _f = extract_cross_from_endpoint(values.get("Street", ""), values.get("From Intersection", ""))
+        _t = extract_cross_from_endpoint(values.get("Street", ""), values.get("To Intersection", ""))
+        values["From Intersection ID"] = _pair_to_id.get((_s, _f), "")
+        values["To Intersection ID"] = _pair_to_id.get((_s, _t), "")
+    except Exception:
+        values["From Intersection ID"] = values.get("From Intersection ID", "")
+        values["To Intersection ID"] = values.get("To Intersection ID", "")
 
-    errors = validate_submission(values, allowed_sets, streets_set)
-    if errors:
-        return render_template_string(
-            EDIT_FORM_HTML,
-            cot_logo_src=COT_LOGO_DATA_URI,
-            row=row,
-            ok=False,
-            errors=errors,
-            districts=DISTRICTS,
-            wards=allowed_sets.get("Ward\n", []),
-            supervisors=latest_allowed_sets.get("Supervisor\n", []),
-            streets=latest_centre_streets,
-            district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
-            shifts=latest_allowed_sets.get("Shift\n", []),
-            types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
-            dump_truck_providers=DUMP_TRUCK_PROVIDERS,
-            snow_dump_sites=SNOW_DUMP_SITES,
-        )
+    # Data entry timestamp
+    try:
+        from datetime import datetime as _dt
+        values["Time and Date of Data Entry Input"] = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
 
-    ok = update_intake_row(sid, values)
-    row2 = get_intake_row_by_submission_id(sid)
+    # Ensure dump-truck source is set if contractor responsibility provided
+    try:
+        if values.get("Contractor: Crew TOA Area Responsibility", "").strip():
+            if not values.get("Dump Truck Source (In-House/Contractor)", "").strip():
+                values["Dump Truck Source (In-House/Contractor)"] = "Contractor"
+    except Exception:
+        pass
 
-    return render_template_string(
-        EDIT_FORM_HTML,
-        cot_logo_src=COT_LOGO_DATA_URI,
-        row=row2 or row,
-        ok=ok,
-        errors=[] if ok else ["Cannot edit (only PENDING rows can be edited)."],
-        districts=DISTRICTS,
-        wards=wards_for_district((row2 or row).get("District\n", "")) or latest_allowed_sets.get("Ward\n", []),
-        supervisors=latest_allowed_sets.get("Supervisor\n", []),
-        streets=latest_centre_streets,
-        district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
-        shifts=latest_allowed_sets.get("Shift\n", []),
-        types=latest_allowed_sets.get("Type (Road Class/ School, Bridge)\n", []),
-    )
+    # Persist back to intake file (so map builder sees edits)
+    # If intake row exists, update it; else append a new one (rare)
+    # --- Persist back to intake (edit only if PENDING) ---
+    if "__status" in intake.columns and not m.empty:
+        st = str(intake.at[m.index[0], "__status"]).strip().upper()
+        if st != "PENDING":
+            return Response("Locked (already applied)", 409)
+
+    # Update intake row
+    if not m.empty:
+        idx0 = m.index[0]
+        for k in MASTER_COLUMNS:
+            if k in intake.columns:
+                intake.at[idx0, k] = values.get(k, "")
+        intake.to_csv(INTAKE_PATH, index=False, encoding="utf-8")
+
+    # Rebuild immediately (optional, but makes UI feel instant)
+    enqueue_build("edit")
+
+    # Redirect back to batch view
+    bid = request.args.get("bid") or str(intake.at[idx0, "__batch_id"]) if (not m.empty and "__batch_id" in intake.columns) else ""
+    return redirect(f"/new?bid={bid}" if bid else "/new")
 
 
 @app.get("/outputs/<path:filename>")
@@ -5461,116 +6552,43 @@ def normalize_single_ward(val: str) -> str:
 
 
 def recompute_allowed_sets_from_master():
+    """Build allowed picklists for the webforms.
+
+    With the new Snow Removal Master Tracker.xlsx schema, we keep district/ward
+    validation based on DISTRICT_TO_WARDS (hard-coded), and we optionally load
+    supervisors from the workbook's "List of Supervisors - Reference" sheet.
+    """
     allowed = {}
 
-    def clean_str(x):
-        return str(x).strip()
+    # District/Ward come from the hard-coded reference (fast + stable)
+    allowed["District (Where Snow Removed)"] = list(STRICT_DISTRICTS) if STRICT_DISTRICTS else list(DISTRICTS)
+    allowed["Ward (Where Snow Removed)"] = sorted(list(STRICT_WARDS) if STRICT_WARDS else list({w for ws in DISTRICT_TO_WARDS.values() for w in ws}), key=lambda x: int(x))
 
-    def is_junk_number(s):
-        return s.isdigit()
-
-    def split_people(s: str):
-        if not s:
-            return []
-        s = clean_str(s)
-        if not s:
-            return []
-        parts = re.split(r"\s*(?:&|/|,)\s*", s)
-        out = []
-        for p in parts:
-            p = clean_str(p)
-            if not p:
-                continue
-            out.append(p)
-        return out
-
-    def unique_preserve_order(seq):
-        seen = set()
-        out = []
-        for x in seq:
-            x = clean_str(x)
-            if not x:
-                continue
-            if x in seen:
-                continue
-            seen.add(x)
-            out.append(x)
-        return out
-
-    def strict_list(lst):
-        return unique_preserve_order([clean_str(x) for x in (lst or []) if clean_str(x)])
-
-    allowed["District\n"] = strict_list(STRICT_DISTRICTS)
-    allowed["Ward\n"] = strict_list(STRICT_WARDS)
-    allowed["Supervisor\n"] = strict_list(STRICT_SUPERVISORS)
-    allowed["Shift\n"] = strict_list(STRICT_SHIFTS)
-    allowed["Type (Road Class/ School, Bridge)\n"] = STRICT_TYPES[:] if STRICT_TYPES else learn("Type (Road Class/ School, Bridge)\n")
-
+    # Supervisors: try to load from the workbook reference tab
+    supervisors = []
     try:
-        df = pd.read_csv(MASTER_TRACKER_PATH, encoding="latin-1")
+        sup_df = pd.read_excel(MASTER_TRACKER_PATH, sheet_name="List of Supervisors - Reference", header=None)
+        if not sup_df.empty:
+            col0 = sup_df.iloc[:, 0].fillna("").astype(str).map(lambda x: x.strip()).tolist()
+            supervisors = [x for x in col0 if x and x.lower() != "nan"]
     except Exception:
-        return allowed
+        supervisors = []
 
-    def learn(col):
-        if allowed.get(col):
-            return
+    if STRICT_SUPERVISORS:
+        supervisors = list(STRICT_SUPERVISORS)
 
-        if col not in df.columns:
-            allowed[col] = []
-            return
-
-        vals = []
-
-        for v in df[col].fillna("").astype(str):
-            v = v.strip()
-            if not v:
-                continue
-
-            if col == "Ward\n":
-                v = normalize_single_ward(v)
-                if not v:
-                    continue
-                vals.append(v)
-                continue
-
-            if col == "District\n":
-                v = re.split(r"[,&/]", v)[0].strip()
-                if v:
-                    vals.append(v)
-                continue
-
-            if col == "Supervisor\n":
-                people = split_people(v)
-                for p in people:
-                    p2 = p.strip()
-                    if not p2:
-                        continue
-                    if is_junk_number(p2):
-                        continue
-                    vals.append(p2)
-                continue
-
-            vals.append(v)
-
-        vals = unique_preserve_order(vals)
-
-        if col == "Ward\n":
-            vals = sorted(vals, key=lambda x: int(x))
-        else:
-            vals = sorted(vals, key=lambda x: x.casefold())
-
-        if len(vals) > 4000:
-            vals = vals[:4000]
-
-        allowed[col] = vals
-
-    learn("District\n")
-    learn("Ward\n")
-    learn("Supervisor\n")
-    learn("Shift\n")
-    learn("Type (Road Class/ School, Bridge)\n")
+    # de-dupe + sort
+    seen = set()
+    out = []
+    for s in supervisors:
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    allowed["Supervisor 1"] = sorted(out, key=lambda x: x.casefold())
 
     return allowed
+
 
 
 def _emit_updated_event(kind: str, items=None):
@@ -5614,15 +6632,16 @@ def watcher_loop():
     while True:
         time.sleep(POLL_INTERVAL_SECONDS)
 
-        cur_fp = file_fingerprint(MASTER_TRACKER_PATH)
-        if cur_fp != last_fp:
-            with LAST_MASTER_WRITE_LOCK:
-                fp_intake = LAST_MASTER_FP_WRITTEN_BY_INTAKE
+        with FILE_LOCK:
+            cur_fp = file_fingerprint(MASTER_TRACKER_PATH)
 
-            if fp_intake is not None and cur_fp == fp_intake:
-                log("Watcher: master changed but was written by intake. Skipping watcher rebuild.")
+        if cur_fp != last_fp:
+            fp_intake = LAST_MASTER_FP_WRITTEN_BY_INTAKE
+            if fp_intake and cur_fp == fp_intake:
+                print("[{}] Watcher: master changed but was written by intake. Skipping watcher rebuild.".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                 last_fp = cur_fp
                 continue
+
 
 
             notify_user(
@@ -5662,18 +6681,82 @@ def intake_poll_loop():
 
     ensure_intake_file()
 
+    def _safe_int(x):
+        try:
+            return int(float(str(x).strip()))
+        except Exception:
+            return 0
+
     while True:
         time.sleep(INTAKE_POLL_SECONDS)
+
+        # ---------------------------------------------------------
+        # FAST PRE-CHECK: if nothing is PENDING (or none eligible yet),
+        # skip heavy apply_intake_to_master() + skip rebuild
+        # ---------------------------------------------------------
         try:
-            applied, applied_items = apply_intake_to_master()
+            with FILE_LOCK:
+                if not os.path.exists(INTAKE_PATH):
+                    continue
+                try:
+                    df0 = pd.read_csv(INTAKE_PATH, dtype=str, encoding="utf-8").fillna("")
+                except Exception:
+                    df0 = pd.read_csv(INTAKE_PATH, dtype=str, encoding="latin-1").fillna("")
+
+            if "__status" not in df0.columns:
+                continue
+
+            now_epoch = int(time.time())
+
+            pend = df0[df0["__status"].astype(str).str.upper() == "PENDING"].copy()
+            if pend.empty:
+                continue
+
+            # eligibility check by pending-until (or submitted time + grace)
+            if "__pending_until_epoch" in pend.columns:
+                pu = pend["__pending_until_epoch"].apply(_safe_int)
+            else:
+                pu = pd.Series([0] * len(pend))
+
+            if pu.max() == 0:
+                # fallback to submitted epoch if pending-until missing
+                if "__submitted_at_epoch" in pend.columns:
+                    sub_epoch = pend["__submitted_at_epoch"].apply(_safe_int)
+                    pu = sub_epoch + int(PENDING_GRACE_SECONDS)
+                elif "__submitted_at" in pend.columns:
+                    ts = pd.to_datetime(pend["__submitted_at"], errors="coerce")
+                    ts = ts.fillna(pd.Timestamp("1970-01-01"))
+                    sub_epoch = (ts.astype("int64") // 10**9).astype(int)
+                    pu = sub_epoch + int(PENDING_GRACE_SECONDS)
+                else:
+                    # no timestamps -> assume eligible (fall through to heavy apply)
+                    pu = pd.Series([0] * len(pend))
+
+            # If *all* pending rows are still inside edit window, do nothing this cycle
+            if len(pu) and pu.min() > now_epoch:
+                continue
+
+        except Exception:
+            # If anything goes weird, fall back to normal behavior (do not block apply)
+            pass
+
+        # ---------------------------------------------------------
+        # HEAVY WORK only when something might apply
+        # ---------------------------------------------------------
+        try:
+            with FILE_LOCK:
+                applied, applied_items = apply_intake_to_master()
+
             if applied > 0:
                 with LAST_INTAKE_APPLIED_LOCK:
                     LAST_INTAKE_APPLIED = applied_items[:]
                     LAST_INTAKE_APPLIED_AT = time.time()
 
                 log(f"INTAKE POLL: applied {applied} new row(s). Rebuilding map...")
+
                 with FILE_LOCK:
                     stats = build_everything()
+
                 latest_allowed_sets = recompute_allowed_sets_from_master()
                 latest_centre_streets = stats.get("centre_streets", [])
                 latest_street_to_cross = stats.get("street_to_cross", {})
@@ -5687,6 +6770,7 @@ def intake_poll_loop():
                 _emit_updated_event("intake", items=applied_items)
 
                 notify_user("Map updated ✅", f"Applied {applied} intake row(s) and rebuilt map.")
+
         except Exception as e:
             log(f"INTAKE POLL: error: {e}")
 
