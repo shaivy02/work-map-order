@@ -15,7 +15,6 @@ from datetime import datetime
 from collections import defaultdict, Counter
 
 import pandas as pd
-from openpyxl import load_workbook
 import folium
 from folium import plugins
 
@@ -53,8 +52,7 @@ def _load_png_data_uri(path: str) -> str:
 COT_LOGO_DATA_URI = _load_png_data_uri(COT_LOGO_PATH)
 
 
-MASTER_TRACKER_PATH = os.path.join(BASE_DIR, "Snow Removal Master Tracker.xlsx")
-MASTER_SHEET_NAME = "Data Input"
+MASTER_TRACKER_PATH = os.path.join(BASE_DIR, "Snow_Removal_Master_Tracker.csv")
 
 # Reference intersections (used for Street + From/To picklists and optional IDs)
 INTERSECTION_REF_PATH = os.path.join(BASE_DIR, "Centreline Intersection - 4326.csv")
@@ -82,7 +80,7 @@ DRAW_INTERSECTION_POINTS = True
 INTERSECTION_POINT_RADIUS = 4
 INTERSECTION_POINT_OPACITY = 0.95
 INTERSECTION_POINT_FILL_OPACITY = 0.85
-INTERSECTION_POINTS_SHOW_BY_DEFAULT = True
+INTERSECTION_POINTS_SHOW_BY_DEFAULT = False
 
 DRAW_WO_SEGMENTS = True
 SEGMENT_OPACITY = 0.01
@@ -186,67 +184,72 @@ UI_PASS = os.environ.get("WO_UI_PASS", "").strip()
 
 STRICT_DISTRICTS = ["EY", "NY", "SC", "TEY"]
 STRICT_WARDS = []
-STRICT_SUPERVISORS = []
+STRICT_SUPERVISORS = [
+    "Adrienne Carnovale",
+    "Ahmad Nabavi",
+    "Anil Pattali",
+    "Antonio Benavidez",
+    "Arsalan Saeed",
+    "Avinash Singh",
+    "Brandon Robinson",
+    "Dennis Dionyssiou",
+    "Dennis Kelly",
+    "Dexta Walker",
+    "Donovan Norville",
+    "Eduardo Moniz",
+    "Florian Osmanaj",
+    "Frank Figliano (TW)",
+    "Garrett Silveira",
+    "Ian MacMillan",
+    "Ian McGhee",
+    "Ivan Gaitan",
+    "Jerry Greco",
+    "Joe Disli",
+    "Joe Machado",
+    "John Alphonso",
+    "John Holowczak",
+    "John Pezzente",
+    "Kevin Bonner",
+    "Kim Daniel",
+    "Leo Debilio",
+    "Les Geroly",
+    "Lorenzo Dasilva",
+    "Marc Cerqua",
+    "Marco Mariani",
+    "Marco Roman",
+    "Matthew Shaw",
+    "Michael Moosaie (TW)",
+    "Michael Pokrajac",
+    "Mike Grieve",
+    "Pasquale Grande",
+    "Pat Monardo",
+    "Rafiqul Islam",
+    "Sami Alani",
+    "Sean Scott",
+    "Sergio D'Amico",
+    "Steve Soria",
+    "Tariq Habib",
+    "Thomas Bertram",
+    "Tomas Chamul",
+    "Tran To",
+    "Varouj Sorfazlian",
+    "Wyatt Cerqua",
+]
 STRICT_SHIFTS = []
 STRICT_TYPES = [
-    # Base road classes
-    "Expressway",
-    "MSSR Arterial",
-    "Arterial",
-    "Collector",
-    "Local",
-    "Road",
-
-    # Road class + features
-    "Arterial, Bike Lane",
-    "Arterial, Bridge",
-    "Arterial, Intersection",
-    "Arterial, Sidewalks",
-    "Arterial, Sidewalks, Bike Lane",
-    "Arterial, Sidewalks, Bridge",
-    "Arterial, Sidewalks, Bridge, Bike Lane",
-
-    "Collector, Bike Lane",
-    "Collector, Bridge",
-    "Collector, Sidewalks",
-    "Collector, Sidewalks, Bike Lane",
-    "Collector, Sidewalks, Bridge",
-    "Collector, TTC Station",
-
-    "Local, Collector",
-    "Local, Sidewalks",
-    "Local, Sidewalks, Bike Lane",
-    "Local, School Zone",
-    "Local, ROW BL",
-    "Local, Priority Hills",
-
-    "MSSR Arterial, Sidewalks",
-    "MSSR Arterial, Bike Lane",
-    "MSSR Arterial, Sidewalks, Bike Lane",
-    "MSSR Arterial, Streetcar",
-    "MSSR Arterial, Streetcar, Bike Lane",
-
-    # Standalone operational categories
-    "Bike Lane",
-    "Bridge",
-    "Sidewalks",
-    "School Zone",
-    "School",
-    "Intersection",
-    "Crosswalk",
-    "Bus Stop",
-    "Bus Bay",
-    "Catch Basins",
-    "Cul-de-sac",
-    "Dead End",
-    "Driveway",
-    "EMS Station",
-    "Sidewalk Obstructions",
-    "Sidewalk Opening",
-    "Sidewalk Snow Piles",
-    "Pile at Intersection",
-    "Pile Collection",
-    "Voting Location",
+    "Backhoe",
+    "Blower",
+    "Cameleon",
+    "FEL w/Blower",
+    "FEL w/Blower & Plow Blade",
+    "FEL w/Bucket",
+    "FEL w/Claw",
+    "FEL w/Plow Blade",
+    "Plow/Salt Unit",
+    "Shovel",
+    "Skid Steer w/Blower",
+    "Skidsteer",
+    "Unknown",
 ]
 
 
@@ -525,16 +528,14 @@ def endpoint_cross_candidates(street_val, endpoint_val):
 # =========================================================
 
 MASTER_COLUMNS = [
-    # === Snow Removal Master Tracker (Data Input sheet) columns ===
+    # === Snow Removal Master Tracker (CSV) columns ===
     "Work Order Number",
     "District (Where Snow Removed)",
     "Ward (Where Snow Removed)",
     "TOA Area (Where Snow Removed)",
     "Street",
     "From Intersection",
-    "From Intersection ID",
     "To Intersection",
-    "To Intersection ID",
     "One Side / Both Sides Cleared?",
     "Side of Road Cleared",
     "Roadway",
@@ -542,6 +543,7 @@ MASTER_COLUMNS = [
     "Separated Cycling Infrastructure",
     "Bridge",
     "School Loading Zones",
+    "Layby Parking",
     "Equipment Method",
     "# of Equipment (Dump Trucks)",
     "Dump Truck Source (In-House/Contractor)",
@@ -693,23 +695,16 @@ def _find_xlsx_header_row(ws, header_key: str = "Work Order Number", scan_rows: 
     return 3
 
 
-def read_master_xlsx() -> pd.DataFrame:
-    """Read master rows from the Excel tracker (Data Input sheet).
+def read_master_csv() -> pd.DataFrame:
+    """Read master rows from the CSV tracker.
 
-    - Finds the header row dynamically (looks for 'Work Order Number')
     - Returns a DataFrame containing at least MASTER_COLUMNS (missing columns filled with '')
     """
     if not os.path.exists(MASTER_TRACKER_PATH):
         raise FileNotFoundError(f"MASTER_TRACKER_PATH not found: {MASTER_TRACKER_PATH}")
 
-    wb = load_workbook(MASTER_TRACKER_PATH, data_only=True, read_only=False)
-    if MASTER_SHEET_NAME not in wb.sheetnames:
-        raise KeyError(f"Sheet '{MASTER_SHEET_NAME}' not found in {MASTER_TRACKER_PATH}")
-    ws = wb[MASTER_SHEET_NAME]
-    header_row = _find_xlsx_header_row(ws)
-
-    # pandas header is 0-based index
-    df = pd.read_excel(MASTER_TRACKER_PATH, sheet_name=MASTER_SHEET_NAME, header=header_row - 1)
+    # Read CSV
+    df = pd.read_csv(MASTER_TRACKER_PATH)
 
     # Drop completely empty rows
     if len(df):
@@ -726,8 +721,8 @@ def read_master_xlsx() -> pd.DataFrame:
     return df
 
 
-def append_rows_to_master_xlsx(rows: list) -> int:
-    """Append list[dict] rows (MASTER_COLUMNS keys) into the Excel tracker.
+def append_rows_to_master_csv(rows: list) -> int:
+    """Append list[dict] rows (MASTER_COLUMNS keys) into the CSV tracker.
 
     Returns number of appended rows.
     """
@@ -738,37 +733,12 @@ def append_rows_to_master_xlsx(rows: list) -> int:
         raise FileNotFoundError(f"MASTER_TRACKER_PATH not found: {MASTER_TRACKER_PATH}")
 
     with FILE_LOCK:
-        wb = load_workbook(MASTER_TRACKER_PATH)
-        if MASTER_SHEET_NAME not in wb.sheetnames:
-            raise KeyError(f"Sheet '{MASTER_SHEET_NAME}' not found in {MASTER_TRACKER_PATH}")
-        ws = wb[MASTER_SHEET_NAME]
-        header_row = _find_xlsx_header_row(ws)
-
-        # Build header -> col index map from the sheet
-        header_cells = list(ws[header_row])
-        header_map = {}
-        for idx, cell in enumerate(header_cells, start=1):
-            name = str(cell.value).strip() if cell.value is not None else ""
-            if name:
-                header_map[name] = idx
-
-        # Find next append row
-        last = ws.max_row
-        # ensure we append after the last non-empty WO row
-        wo_idx = header_map.get("Work Order Number")
-        if wo_idx:
-            for r in range(ws.max_row, header_row, -1):
-                v = ws.cell(row=r, column=wo_idx).value
-                if v is not None and str(v).strip() != "":
-                    last = r
-                    break
-            append_row = last + 1
-        else:
-            append_row = ws.max_row + 1
-
+        # Read existing CSV
+        df = pd.read_csv(MASTER_TRACKER_PATH)
+        
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        appended = 0
+        # Process each row
         for row in rows:
             # Auto-fill Data Entry timestamp if missing
             if not str(row.get("Time and Date of Data Entry Input", "")).strip():
@@ -778,18 +748,14 @@ def append_rows_to_master_xlsx(rows: list) -> int:
             if not str(row.get("Shift End Date", "")).strip():
                 row["Shift End Date"] = row.get("Shift Start Date", "")
 
-            # Write each known column
-            for col_name, col_idx in header_map.items():
-                if col_name not in row:
-                    continue
-                ws.cell(row=append_row, column=col_idx).value = row.get(col_name, "")
+        # Convert rows to DataFrame and append
+        new_df = pd.DataFrame(rows)
+        df = pd.concat([df, new_df], ignore_index=True)
+        
+        # Save back to CSV
+        df.to_csv(MASTER_TRACKER_PATH, index=False)
 
-            append_row += 1
-            appended += 1
-
-        wb.save(MASTER_TRACKER_PATH)
-
-    return appended
+    return len(rows)
 
 
 
@@ -896,9 +862,10 @@ _STREET_ENDPOINTS_CACHE = {"fp": None, "street_endpoints": {}}
 
 def get_street_endpoints_index():
     """
-    Build a Street -> [IntersectionName...] mapping from the Snow Removal Master Tracker.xlsx.
+    Build a Street -> [IntersectionName...] mapping from the Snow Removal Master Tracker.
 
-    Source sheet: StreetEndPoints (columns: linear_name_full, intersection_name)
+    For CSV mode: Creates formatted strings like "Dundas St E / Logan Ave" from intersection reference.
+    For XLSX mode: Uses StreetEndPoints sheet if available.
 
     Keys are normalized to UPPER via normalize_street_name so the browser can do
     fast lookups without API calls.
@@ -912,10 +879,46 @@ def get_street_endpoints_index():
     if _STREET_ENDPOINTS_CACHE.get("fp") == fp and _STREET_ENDPOINTS_CACHE.get("street_endpoints"):
         return _STREET_ENDPOINTS_CACHE["street_endpoints"]
 
+    # CSV mode: build from intersection reference with formatted strings
+    if MASTER_TRACKER_PATH.endswith('.csv'):
+        street_to_cross, _ = get_intersection_reference()
+        
+        # Get raw intersection data to find original descriptions
+        if not os.path.exists(INTERSECTION_REF_PATH):
+            return {}
+        
+        try:
+            int_df = pd.read_csv(INTERSECTION_REF_PATH, dtype=str)
+        except Exception:
+            return {}
+        
+        # Build mapping of normalized street -> list of formatted intersection strings
+        out = {}
+        for _, row in int_df.iterrows():
+            desc = str(row.get("INTERSECTION_DESC", "") or "").strip()
+            if not desc or desc.lower() == "nan":
+                continue
+            
+            parts = [p.strip() for p in desc.split("/") if str(p).strip()]
+            if len(parts) < 2:
+                continue
+            
+            # For each street in the intersection, add the full formatted string
+            for part in parts:
+                norm_part = normalize_street_name(part)
+                if norm_part:
+                    out.setdefault(norm_part, set()).add(desc)
+        
+        # Sort and convert to lists
+        out = {k: sorted(list(v), key=lambda x: x.casefold()) for k, v in out.items()}
+        _STREET_ENDPOINTS_CACHE = {"fp": fp, "street_endpoints": out}
+        return out
+
+    # XLSX mode: try to use StreetEndPoints sheet
     try:
         df = pd.read_excel(MASTER_TRACKER_PATH, sheet_name="StreetEndPoints", dtype=str)
     except Exception:
-        # If the sheet is missing, fall back to the intersection CSV (less ideal for dropdown labels)
+        # Fallback to intersection reference
         street_to_cross, _ = get_intersection_reference()
         out = {k: v[:] for k, v in (street_to_cross or {}).items()}
         _STREET_ENDPOINTS_CACHE = {"fp": fp, "street_endpoints": out}
@@ -1483,7 +1486,7 @@ def apply_intake_to_master():
 
         # Build duplicate guard from current master
         try:
-            master_df = read_master_xlsx()
+            master_df = read_master_csv()
         except Exception as e:
             log(f"INTAKE APPLY: failed to read master xlsx: {e}")
             return 0, []
@@ -1533,7 +1536,7 @@ def apply_intake_to_master():
 
         # Append to Excel master
         try:
-            appended = append_rows_to_master_xlsx(new_rows)
+            appended = append_rows_to_master_csv(new_rows)
         except Exception as e:
             log(f"INTAKE APPLY: failed to append to master xlsx: {e}")
             return 0, []
@@ -1557,45 +1560,16 @@ def apply_intake_to_master():
 
 
 def build_workorder_popup(props: dict) -> str:
-    wo = props.get("WO", "")
-    date = props.get("ShiftStartDate", "")
-    district = props.get("District", "")
-    ward = props.get("Ward", "")
-    toa = props.get("TOA", "")
-    supervisor = props.get("Supervisor", "")
-    shift = props.get("Shift", "")
-    street = props.get("Street", "")
-    frm = props.get("From", "")
-    to_ = props.get("To", "")
-    side = props.get("Side", "")
-    road_side = props.get("RoadSide", "")
-    roadway = props.get("Roadway", "")    
-    sidewalk = props.get("Sidewalk", "")
-    cycling = props.get("SeparatedCycling", "")
-    bridge = props.get("Bridge", "")
-    school = props.get("SchoolZones", "")
-    equipment = props.get("EquipmentMethod", "")
-    dump_trucks = props.get("DumpTrucks", "")
-    dump_source = props.get("DumpTruckSource", "")
-    contractor_toa = props.get("ContractorTOA", "")
-    snow_site = props.get("SnowDumpSite", "")
-    loads = props.get("Loads", "")
-    tonnes = props.get("Tonnes", "")
-    crew_type = props.get("CrewType", "")
-    num_crews = props.get("NumCrews", "")
-    crew_num = props.get("CrewNumber", "")
-    inhouse = props.get("InHouseBase", "")
-    num_staff = props.get("NumStaff", "")
-    notes = props.get("Notes", "")
-    route_mode = props.get("route_mode", "")
-
+    """Build comprehensive popup showing ALL fields for every work order."""
+    
     # Helper: only show rows with data
-    def row(label, val):
-        v = str(val or "").strip()
+    def row(label, key):
+        v = str(props.get(key, "")).strip()
         if not v or v.lower() in ("nan", "none", ""):
             return ""
         return f"<b>{html.escape(label)}:</b> {html.escape(v)}<br>"
-
+    
+    route_mode = props.get("Routing_Mode", "")
     extra = ""
     if route_mode:
         extra = (
@@ -1603,53 +1577,70 @@ def build_workorder_popup(props: dict) -> str:
             f"<b>Routing:</b> {html.escape(str(route_mode))}"
             "</div>"
         )
-
+    
+    wo = props.get("Work_Order_Number", "")
+    
     return f"""
-    <div style='font-family:Arial;font-size:13px;line-height:1.25;max-width:420px;'>
+    <div style='font-family:Arial;font-size:13px;line-height:1.25;max-width:450px;max-height:600px;overflow-y:auto;'>
       <div style='font-size:15px;font-weight:800;margin-bottom:8px;'>Work Order {html.escape(str(wo))}</div>
       
-      <b>Street:</b> {html.escape(str(street))}<br>
-      <b>From:</b> {html.escape(str(frm))}<br>
-      <b>To:</b> {html.escape(str(to_))}<br>
+      {row('Street', 'Street')}
+      {row('From', 'From_Intersection')}
+      {row('To', 'To_Intersection')}
       {extra}
       
       <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+      <div style='font-weight:700;margin-bottom:4px;'>Administrative</div>
       
-      <b>Supervisor:</b> {html.escape(str(supervisor))}<br>
-      <b>District:</b> {html.escape(str(district))}<br>
-      <b>Ward:</b> {html.escape(str(ward))}<br>
-      {row('TOA Area', toa)}
-      <b>Date:</b> {html.escape(str(date))}<br>
-      <b>Shift:</b> {html.escape(str(shift))}<br>
-      
-      <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
-      
-      {row('Side Cleared', side)}
-      {row('Road Side', road_side)}
-      {row('Roadway', roadway)}
-      {row('Sidewalk', sidewalk)}
-      {row('Cycling Infra', cycling)}
-      {row('Bridge', bridge)}
-      {row('School Zones', school)}
+      {row('Supervisor 1', 'Supervisor_1')}
+      {row('Supervisor 2', 'Supervisor_2')}
+      {row('Supervisor 3', 'Supervisor_3')}
+      {row('District', 'District')}
+      {row('Ward', 'Ward')}
+      {row('TOA Area', 'TOA_Area')}
+      {row('Shift Start Date', 'Shift_Start_Date')}
+      {row('Shift Start Time', 'Shift_Start_Time')}
+      {row('Shift End Date', 'Shift_End_Date')}
+      {row('Shift End Time', 'Shift_End_Time')}
       
       <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+      <div style='font-weight:700;margin-bottom:4px;'>Operational Details</div>
       
-      {row('Equipment', equipment)}
-      {row('Dump Trucks', dump_trucks)}
-      {row('Source', dump_source)}
-      {row('Contractor TOA', contractor_toa)}
-      {row('Loads', loads)}
-      {row('Tonnes', tonnes)}
-      {row('Snow Site', snow_site)}
-      
-      {row('Crew Type', crew_type)}
-      {row('# Crews', num_crews)}
-      {row('Crew #', crew_num)}
-      {row('In-House Base', inhouse)}
-      {row('# Staff', num_staff)}
+      {row('Side Cleared', 'Side_Cleared')}
+      {row('Road Side', 'Road_Side')}
       
       <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
-      {row('Notes', notes)}
+      <div style='font-weight:700;margin-bottom:4px;'>Infrastructure</div>
+      
+      {row('Roadway', 'Roadway')}
+      {row('Sidewalk', 'Sidewalk')}
+      {row('Cycling', 'Cycling_Infrastructure')}
+      {row('Bridge', 'Bridge')}
+      {row('School Zones', 'School_Zones')}
+      {row('Layby Parking', 'Layby_Parking')}
+      
+      <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+      <div style='font-weight:700;margin-bottom:4px;'>Equipment & Resources</div>
+      
+      {row('Equipment Method', 'Equipment_Method')}
+      {row('# Dump Trucks', 'Dump_Trucks_Count')}
+      {row('Truck Source', 'Dump_Truck_Source')}
+      {row('# Loads', 'Number_of_Loads')}
+      {row('Tonnes', 'Tonnes')}
+      {row('Snow Dump Site', 'Snow_Dump_Site')}
+      
+      <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+      <div style='font-weight:700;margin-bottom:4px;'>Crew Information</div>
+      
+      {row('Crew Type', 'Crew_Type')}
+      {row('# of Crews', 'Number_of_Crews')}
+      {row('Contractor TOA', 'Contractor_TOA')}
+      {row('Crew Number', 'Crew_Number')}
+      {row('In-House Base', 'InHouse_Base_Yard')}
+      {row('# Staff', 'Number_of_Staff')}
+      
+      <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+      {row('Notes', 'Notes')}
     </div>
     """
 # =========================================================
@@ -1916,7 +1907,7 @@ def build_everything():
         if not os.path.exists(CENTRELINE_PATH):
             raise FileNotFoundError(f"CENTRELINE_PATH not found: {CENTRELINE_PATH}")
 
-        master = read_master_xlsx()
+        master = read_master_csv()
         centre = pd.read_csv(CENTRELINE_PATH, encoding="latin-1")
 
         log(f"Centreline rows: {len(centre)}")
@@ -2066,7 +2057,7 @@ def build_everything():
 
         def style_for_feature(feat):
             props = feat["properties"]
-            color = props.get("stroke_color", "red")
+            color = props.get("Line_Color", "red")
             work_type = props.get("Type", "").upper()
 
             weight = 4
@@ -2086,7 +2077,7 @@ def build_everything():
 
         def style_for_segment(feat):
             props = feat["properties"]
-            color = props.get("stroke_color", "red")
+            color = props.get("Line_Color", "red")
             return {"color": color, "weight": SEGMENT_WEIGHT, "opacity": SEGMENT_OPACITY, "dashArray": "0"}
 
         def similarity(a: str, b: str) -> float:
@@ -2378,42 +2369,49 @@ def build_everything():
 
         def build_segment_popup(props: dict) -> str:
             """Build segment popup with ALL fields matching workorder popup structure."""
-            wo = props.get("WO_ID", "")
-            date = props.get("Date", "")
+            wo = props.get("Work_Order_Number", "")
+            date = props.get("Shift_Date", "")
             district = props.get("District", "")
             ward = props.get("Ward", "")
-            toa = props.get("TOA", "")
-            supervisor = props.get("Supervisor", "")
-            shift = props.get("Shift", "")
-            street = props.get("Location", "")
-            frm = props.get("From", "")
-            to_ = props.get("To", "")
-            side = props.get("Side", "")
-            road_side = props.get("RoadSide", "")
+            toa = props.get("TOA_Area", "")
+            supervisor = props.get("Supervisor_1", "")
+            supervisor_2 = props.get("Supervisor_2", "")
+            supervisor_3 = props.get("Supervisor_3", "")
+            shift = props.get("Shift_Time", "")
+            shift_start_date = props.get("Shift_Start_Date", "")
+            shift_start_time = props.get("Shift_Start_Time", "")
+            shift_end_date = props.get("Shift_End_Date", "")
+            shift_end_time = props.get("Shift_End_Time", "")
+            street = props.get("Street", "")
+            frm = props.get("From_Intersection", "")
+            to_ = props.get("To_Intersection", "")
+            side = props.get("Side_Cleared", "")
+            road_side = props.get("Road_Side", "")
             roadway = props.get("Roadway", "")    
             sidewalk = props.get("Sidewalk", "")
-            cycling = props.get("SeparatedCycling", "")
+            cycling = props.get("Cycling_Infrastructure", "")
             bridge = props.get("Bridge", "")
-            school = props.get("SchoolZones", "")
-            equipment = props.get("EquipmentMethod", "")
-            dump_trucks = props.get("DumpTrucks", "")
-            dump_source = props.get("DumpTruckSource", "")
-            contractor_toa = props.get("ContractorTOA", "")
-            snow_site = props.get("SnowDumpSite", "")
-            loads = props.get("Loads", "")
+            school = props.get("School_Zones", "")
+            layby_parking = props.get("Layby_Parking", "")
+            equipment = props.get("Equipment_Method", "")
+            dump_trucks = props.get("Dump_Trucks_Count", "")
+            dump_source = props.get("Dump_Truck_Source", "")
+            contractor_toa = props.get("Contractor_TOA", "")
+            snow_site = props.get("Snow_Dump_Site", "")
+            loads = props.get("Number_of_Loads", "")
             tonnes = props.get("Tonnes", "")
-            crew_type = props.get("CrewType", "")
-            num_crews = props.get("NumCrews", "")
-            crew_num = props.get("CrewNumber", "")
-            inhouse = props.get("InHouseBase", "")
-            num_staff = props.get("NumStaff", "")
-            notes = props.get("Comments", "") or props.get("Notes", "")
-            route_mode = props.get("route_mode", "")
+            crew_type = props.get("Crew_Type", "")
+            num_crews = props.get("Number_of_Crews", "")
+            crew_num = props.get("Crew_Number", "")
+            inhouse = props.get("InHouse_Base_Yard", "")
+            num_staff = props.get("Number_of_Staff", "")
+            notes = props.get("Notes", "")
+            route_mode = props.get("Routing_Mode", "")
             
             # Segment-specific fields
-            wo_m_str = props.get("WO_m_display", "")
-            wo_km_str = props.get("WO_km_display", "")
-            segment_count = props.get("Segment_count", "")
+            wo_m_str = props.get("Total_Meters_Display", "")
+            wo_km_str = props.get("Total_KM_Display", "")
+            segment_count = props.get("Total_Segments", "")
             
             # Helper: only show rows with data
             def row(label, val):
@@ -2441,12 +2439,14 @@ def build_everything():
               
               <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
               
-              <b>Supervisor:</b> {html.escape(str(supervisor))}<br>
+              {row('Supervisor 1', supervisor)}
+              {row('Supervisor 2', supervisor_2)}
+              {row('Supervisor 3', supervisor_3)}
               <b>District:</b> {html.escape(str(district))}<br>
               <b>Ward:</b> {html.escape(str(ward))}<br>
               {row('TOA Area', toa)}
-              <b>Date:</b> {html.escape(str(date))}<br>
-              <b>Shift:</b> {html.escape(str(shift))}<br>
+              <b>Start:</b> {html.escape(str(shift_start_date))} {html.escape(str(shift_start_time))}<br>
+              <b>End:</b> {html.escape(str(shift_end_date))} {html.escape(str(shift_end_time))}<br>
               
               <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
               
@@ -2457,6 +2457,7 @@ def build_everything():
               {row('Cycling Infra', cycling)}
               {row('Bridge', bridge)}
               {row('School Zones', school)}
+              {row('Layby Parking', layby_parking)}
               
               <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
               
@@ -3134,6 +3135,10 @@ def build_everything():
             wo_id, loc_raw, from_raw, to_raw, district_val, ward, date_str, shift_str,
             supervisor_raw, sup_key, work_type, supervisor_link_html, shift_display_html, wo_total_m,
             route_mode="",
+            shift_start_date="",
+            shift_start_time="",
+            shift_end_date="",
+            shift_end_time="",
             toa="",
             dump_trucks="",
             dump_provider="",
@@ -3148,6 +3153,7 @@ def build_everything():
             cycling_infra="",
             bridge="",
             school_zones="",
+            layby_parking="",
             equipment="",
             contractor_toa="",
             crew_type="",
@@ -3181,74 +3187,66 @@ def build_everything():
                     return "" if pd.isna(v) else str(v)
 
                 props = {
-                    "feature_kind": "workorder_segment",
-                    "WO_ID": str(wo_id),
-                    "Location": str(loc_raw),
-                    "From": str(from_raw),
-                    "To": str(to_raw),
-                    "Street_resolved": str(street_key),
+                    "Feature_Type": "workorder_segment",
+                    "Work_Order_Number": str(wo_id),
+                    "Street": str(loc_raw),
+                    "From_Intersection": str(from_raw),
+                    "To_Intersection": str(to_raw),
+                    "Street_Normalized": str(street_key),
                     "District": str(district_val),
                     "Ward": str(ward),
-                    "Date": str(date_str),
-                    "Shift": str(shift_str),
-                    "Supervisor": str(supervisor_raw),
-                    "SupervisorKey": str(sup_key),
-                    "Type": str(work_type),
+                    "Shift_Date": str(date_str),
+                    "Shift_Time": str(shift_str),
+                    "Shift_Start_Date": str(shift_start_date or date_str),
+                    "Shift_Start_Time": str(shift_start_time),
+                    "Shift_End_Date": str(shift_end_date or date_str),
+                    "Shift_End_Time": str(shift_end_time),
+                    "Supervisor_1": str(supervisor_raw),
+                    "Supervisor_2": str(supervisor_2_raw),
+                    "Supervisor_3": str(supervisor_3_raw),
 
-                    # ✅ WEBFORM-style DISPLAY fields (NEW)
-                    "WO": str(wo_id),
-                    "District__NL": str(district_val),
-                    "Ward__NL": str(ward),
-                    "Date__NL": str(date_str),
-                    "Shift__NL": str(shift_str),
-                    "Supervisor__NL": str(supervisor_raw).strip(),
-                    "Type__NL": str(work_type),
-
+                    # Segment-specific fields
                     "From_Intersection_ID": int(seg["u"]),
                     "To_Intersection_ID": int(seg["v"]),
-                    "Segment_idx": int(idx),
-                    "Segment_count": int(seg_count),
-                    "Segment_m": float(seg_m),
-                    "Segment_km": float(seg_km),
+                    "Segment_Index": int(idx),
+                    "Total_Segments": int(seg_count),
+                    "Segment_Distance_Meters": float(seg_m),
+                    "Segment_Distance_KM": float(seg_km),
+                    "Segment_Meters_Display": fmt_sigfig(seg_m, 2),
+                    "Segment_KM_Display": fmt_sigfig(seg_km, 2),
+                    "Segment_From_Street": str(seg_from_label),
+                    "Segment_To_Street": str(seg_to_label),
+                    "Total_Distance_Meters": float(wo_total_m),
+                    "Total_Distance_KM": float(wo_total_km),
+                    "Total_Meters_Display": fmt_sigfig(wo_total_m, 2),
+                    "Total_KM_Display": fmt_sigfig(wo_total_km, 2),
 
-                    "Segment_m_display": fmt_sigfig(seg_m, 2),
-                    "Segment_km_display": fmt_sigfig(seg_km, 2),
-
-                    "Seg_From": str(seg_from_label),
-                    "Seg_To": str(seg_to_label),
-
-                    "WO_m": float(wo_total_m),
-                    "WO_km": float(wo_total_km),
-                    "WO_m_display": fmt_sigfig(wo_total_m, 2),
-                    "WO_km_display": fmt_sigfig(wo_total_km, 2),
-
-                    "Supervisor_link_html": supervisor_link_html,
-                    "Shift_html": shift_display_html,
-                    "route_mode": route_mode,
+                    "Routing_Mode": route_mode,
                     
-                    # All operational fields from master tracker
-                    "TOA": clean(toa),
-                    "Side": clean(side),
-                    "RoadSide": clean(road_side),
+                    # All operational fields
+                    "TOA_Area": clean(toa),
+                    "Side_Cleared": clean(side),
+                    "Road_Side": clean(road_side),
                     "Roadway": clean(roadway),
                     "Sidewalk": clean(sidewalk),
-                    "SeparatedCycling": clean(cycling_infra),
+                    "Cycling_Infrastructure": clean(cycling_infra),
                     "Bridge": clean(bridge),
-                    "SchoolZones": clean(school_zones),
-                    "EquipmentMethod": clean(equipment),
-                    "DumpTrucks": clean(dump_trucks),
-                    "DumpTruckSource": clean(dump_provider),
-                    "ContractorTOA": clean(contractor_toa),
-                    "Loads": clean(loads),
+                    "School_Zones": clean(school_zones),
+                    "Layby_Parking": clean(layby_parking),
+                    "Equipment_Method": clean(equipment),
+                    "Dump_Trucks_Count": clean(dump_trucks),
+                    "Dump_Truck_Source": clean(dump_provider),
+                    "Contractor_TOA": clean(contractor_toa),
+                    "Number_of_Loads": clean(loads),
                     "Tonnes": clean(tonnes),
-                    "SnowDumpSite": clean(snow_dump_site),
-                    "CrewType": clean(crew_type),
-                    "NumCrews": clean(num_crews),
-                    "CrewNumber": clean(crew_number),
-                    "InHouseBase": clean(inhouse_base),
-                    "NumStaff": clean(num_staff),
-                    "Comments": clean(comments),
-                    "stroke_color": str(district_color),
+                    "Snow_Dump_Site": clean(snow_dump_site),
+                    "Crew_Type": clean(crew_type),
+                    "Number_of_Crews": clean(num_crews),
+                    "Crew_Number": clean(crew_number),
+                    "InHouse_Base_Yard": clean(inhouse_base),
+                    "Number_of_Staff": clean(num_staff),
+                    "Notes": clean(comments),
+                    "Line_Color": str(district_color),
                 }
 
                 seg_feature = {"type": "Feature", "geometry": seg_geometry, "properties": props}
@@ -3260,7 +3258,7 @@ def build_everything():
                     data=seg_feature,
                     style_function=style_for_segment,
                     highlight_function=lambda feat: {
-                        "color": feat["properties"].get("stroke_color", "red"),
+                        "color": feat["properties"].get("Line_Color", "red"),
                         "weight": 8,
                         "opacity": 0.9,
                     },
@@ -3269,14 +3267,14 @@ def build_everything():
 
                 seg_tooltip = folium.GeoJsonTooltip(
                     fields=[
-                        "WO_ID",
-                        "Segment_idx",
-                        "Segment_count",
-                        "Location",
-                        "Seg_To",
-                        "Seg_From",
-                        "Segment_m_display",
-                        "Segment_km_display",
+                        "Work_Order_Number",
+                        "Segment_Index",
+                        "Total_Segments",
+                        "Street",
+                        "Segment_To_Street",
+                        "Segment_From_Street",
+                        "Segment_Meters_Display",
+                        "Segment_KM_Display",
                     ],
                     aliases=[
                         "WO",
@@ -3318,62 +3316,70 @@ def build_everything():
 
         def add_line_feature(row, wo_id, geometry, color, district_val, ward_val, date_val, shift_val,
                      supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
-                     loc_key=None, from_key=None, to_key=None, route_mode=""):
+                     loc_key=None, from_key=None, to_key=None, route_mode="", wo_total_m=0):
 
             props = {
-                "feature_kind": "workorder_line",
-                "WO_ID": normalize_wo_id(wo_id),
-                "WO": normalize_wo_id(wo_id),
-
-                # Location
-                "Location": str(loc_raw),
+                "Feature_Type": "workorder_line",
+                "Work_Order_Number": normalize_wo_id(wo_id),
+                
+                # Location fields
                 "Street": str(loc_raw),
-                "From": str(from_raw),
-                "To": str(to_raw),
-                "FromIntersection": str(from_raw),
-                "ToIntersection": str(to_raw),
-                "Street_resolved": loc_key,
-                "From_resolved": from_key,
-                "To_resolved": to_key,
+                "From_Intersection": str(from_raw),
+                "To_Intersection": str(to_raw),
+                "Street_Normalized": loc_key,
+                "From_Normalized": from_key,
+                "To_Normalized": to_key,
 
-                # Admin
+                # Administrative fields
                 "District": district_val,
                 "Ward": ward_val,
-                "Supervisor": str(supervisor_raw).strip(),
-                "SupervisorKey": sup_key,
-                "ShiftStartDate": date_val,
-                "Shift": shift_val,
+                "Supervisor_1": str(supervisor_raw).strip(),
+                "Supervisor_2": str(supervisor_2_raw).strip(),
+                "Supervisor_3": str(supervisor_3_raw).strip(),
+                "Shift_Date": date_val,
+                "Shift_Time": shift_val,
+                "Shift_Start_Date": date_val,
+                "Shift_Start_Time": shift_start_t,
+                "Shift_End_Date": str(row.get("Shift End Date", "")).strip(),
+                "Shift_End_Time": shift_end_t,
+                
+                # Distance fields (formatted only)
+                "Total_Meters": fmt_sigfig(wo_total_m, 2) if wo_total_m > 0 else "0",
+                "Total_KM": fmt_sigfig(wo_total_m / 1000.0, 2) if wo_total_m > 0 else "0",
                 
                 # Operational fields
-                "TOA": clean_text(row.get("TOA Area (Where Snow Removed)", "")),
-                "Side": clean_text(row.get("One Side / Both Sides Cleared?", "")),
-                "RoadSide": clean_text(row.get("Side of Road Cleared", "")),
+                "TOA_Area": clean_text(row.get("TOA Area (Where Snow Removed)", "")),
+                "Side_Cleared": clean_text(row.get("One Side / Both Sides Cleared?", "")),
+                "Road_Side": clean_text(row.get("Side of Road Cleared", "")),
                 
+                # Infrastructure
                 "Roadway": clean_text(row.get("Roadway", "")),
                 "Sidewalk": clean_text(row.get("Sidewalk", "")),
-                "SeparatedCycling": clean_text(row.get("Separated Cycling Infrastructure", "")),
+                "Cycling_Infrastructure": clean_text(row.get("Separated Cycling Infrastructure", "")),
                 "Bridge": clean_text(row.get("Bridge", "")),
-                "SchoolZones": clean_text(row.get("School Loading Zones", "")),
+                "School_Zones": clean_text(row.get("School Loading Zones", "")),
+                "Layby_Parking": clean_text(row.get("Layby Parking", "")),
                 
-                "EquipmentMethod": clean_text(row.get("Equipment Method", "")),
-                "DumpTrucks": clean_text(row.get("# of Equipment (Dump Trucks)", "")),
-                "DumpTruckSource": clean_text(row.get("Dump Truck Source (In-House/Contractor)", "")),
-                "ContractorTOA": clean_text(row.get("Contractor: Crew TOA Area Responsibility", "")),
-                "Loads": clean_text(row.get("# of Loads", "")),
+                # Equipment
+                "Equipment_Method": clean_text(row.get("Equipment Method", "")),
+                "Dump_Trucks_Count": clean_text(row.get("# of Equipment (Dump Trucks)", "")),
+                "Dump_Truck_Source": clean_text(row.get("Dump Truck Source (In-House/Contractor)", "")),
+                "Number_of_Loads": clean_text(row.get("# of Loads", "")),
                 "Tonnes": clean_text(row.get("Tonnes", "")),
-                "SnowDumpSite": clean_text(row.get("Snow Dump Site", "")),
+                "Snow_Dump_Site": clean_text(row.get("Snow Dump Site", "")),
                 
-                "CrewType": clean_text(row.get("Snow Removal by Contracted Crew or In-House?", "")),
-                "NumCrews": clean_text(row.get("Contractor: # of Crews", "")),
-                "CrewNumber": clean_text(row.get("Contractor: Crew Number", "")),
-                "InHouseBase": clean_text(row.get("In-House: Staff Responsibility (Base Yard)", "")),
-                "NumStaff": clean_text(row.get("In-House: # of Staff", "")),
+                # Crew information
+                "Crew_Type": clean_text(row.get("Snow Removal by Contracted Crew or In-House?", "")),
+                "Contractor_TOA": clean_text(row.get("Contractor: Crew TOA Area Responsibility", "")),
+                "Number_of_Crews": clean_text(row.get("Contractor: # of Crews", "")),
+                "Crew_Number": clean_text(row.get("Contractor: Crew Number", "")),
+                "InHouse_Base_Yard": clean_text(row.get("In-House: Staff Responsibility (Base Yard)", "")),
+                "Number_of_Staff": clean_text(row.get("In-House: # of Staff", "")),
                 
+                # Notes and metadata
                 "Notes": clean_text(row.get("NOTES", "")),
-                "Type": type_val,
-
-                "stroke_color": color,
-                "route_mode": route_mode,
+                "Routing_Mode": route_mode,
+                "Line_Color": color,
             }
 
             feature = {"type": "Feature", "geometry": geometry, "properties": props}
@@ -3383,16 +3389,17 @@ def build_everything():
                 data=feature,
                 style_function=style_for_feature,
                 highlight_function=lambda feat: {
-                    "color": feat["properties"].get("stroke_color", "red"),
+                    "color": feat["properties"].get("Line_Color", "red"),
                     "weight": 7,
                     "opacity": 1.0,
                 },
                 name=f"WO {wo_id}",
             )
 
-            # ✅ FIXED TOOLTIP - Use actual property keys
+            # ✅ FIXED TOOLTIP - Use clear field names
             tooltip = folium.GeoJsonTooltip(
-                fields=["WO_ID", "Location", "From", "To", "District", "Supervisor", "ShiftStartDate", "Shift"],
+                fields=["Work_Order_Number", "Street", "From_Intersection", "To_Intersection", 
+                        "District", "Supervisor_1", "Shift_Date", "Shift_Time"],
                 aliases=["WO", "Street", "From", "To", "District", "Supervisor", "Date", "Shift"],
                 sticky=False,
             )
@@ -3461,6 +3468,8 @@ def build_everything():
 
             supervisor_raw = row.get("Supervisor 1", "")
             sup_key = make_supervisor_key(supervisor_raw)
+            supervisor_2_raw = row.get("Supervisor 2 (if relevant)", "")
+            supervisor_3_raw = row.get("Supervisor 3 (if relevant)", "")
 
             from_is_str = isinstance(from_raw, str)
             to_is_str = isinstance(to_raw, str)
@@ -3484,9 +3493,11 @@ def build_everything():
                     continue
 
                 geometry = {"type": "MultiLineString", "coordinates": coords_to_use}
+                wo_total_m = multiline_distance_m(coords_to_use)
+                
                 add_line_feature(row, wo_id, geometry, color, district_val, ward_val, date_val, shift_val,
                                  supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
-                                 loc_key=loc_key, route_mode="ENTIRE STREET")
+                                 loc_key=loc_key, route_mode="ENTIRE STREET", wo_total_m=wo_total_m)
                 subsegment_count += 1
 
                 if is_intake_row:
@@ -3627,11 +3638,14 @@ def build_everything():
                 coords_to_use = full_street_multiline(loc_key)
                 if coords_to_use:
                     geometry = {"type": "MultiLineString", "coordinates": coords_to_use}
+                    wo_total_m = multiline_distance_m(coords_to_use)
+                    
                     add_line_feature(
                         row, wo_id, geometry, color, district_val, ward_val, date_val, shift_val,
                         supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
                         loc_key=loc_key, from_key=from_key, to_key=to_key,
-                        route_mode=f"Points not found in centreline. Mapping Full Street as FALLBACK ({reason_detail})"
+                        route_mode=f"Points not found in centreline. Mapping Full Street as FALLBACK ({reason_detail})",
+                        wo_total_m=wo_total_m
                     )
                     subsegment_count += 1
                     if is_intake_row:
@@ -3678,11 +3692,14 @@ def build_everything():
                     coords_to_use = build_path_multiline_global(node_path_g, edge_idx_g)
                     if coords_to_use:
                         geometry = {"type": "MultiLineString", "coordinates": coords_to_use}
+                        wo_total_m = multiline_distance_m(coords_to_use)
+                        
                         add_line_feature(
                             row, wo_id, geometry, color, district_val, ward_val, date_val, shift_val,
                             supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
                             loc_key=loc_key, from_key=from_key, to_key=to_key,
-                            route_mode="Path not found on street. Using global routing as FALLBACK"
+                            route_mode="Path not found on street. Using global routing as FALLBACK",
+                            wo_total_m=wo_total_m
                         )
                         subsegment_count += 1
                         if is_intake_row:
@@ -3720,15 +3737,17 @@ def build_everything():
                 continue
 
             geometry = {"type": "MultiLineString", "coordinates": coords_to_use}
+            wo_total_m = multiline_distance_m(coords_to_use)
+            
             add_line_feature(
                 row, wo_id, geometry, color, district_val, ward_val, date_val, shift_val,
                 supervisor_raw, sup_key, type_val, loc_raw, from_raw, to_raw,
                 loc_key=loc_key, from_key=from_key, to_key=to_key,
-                route_mode="Exact Location found and Mapped"
+                route_mode="Exact Location found and Mapped",
+                wo_total_m=wo_total_m
             )
             subsegment_count += 1
 
-            wo_total_m = multiline_distance_m(coords_to_use)
             add_wo_segments(
                 street_key=loc_key,
                 node_path=node_path,
@@ -3746,9 +3765,13 @@ def build_everything():
                 sup_key=sup_key,
                 work_type=type_val,
                 supervisor_link_html=make_supervisor_link(supervisor_raw, sup_key),
-                shift_display_html=format_shift_with_icons(row.get("Shift", "")),
+                shift_display_html=format_shift_with_icons(shift_val),
                 wo_total_m=wo_total_m,
                 route_mode="Exact Location found and Mapped",
+                shift_start_date=row.get("Shift Start Date", ""),
+                shift_start_time=row.get("Shift Start Time", ""),
+                shift_end_date=row.get("Shift End Date", ""),
+                shift_end_time=row.get("Shift End Time", ""),
                 toa=row.get("TOA Area (Where Snow Removed)", ""),
                 dump_trucks=row.get("# of Equipment (Dump Trucks)", ""),
                 dump_provider=row.get("Dump Truck Source (In-House/Contractor)", ""),
@@ -3763,6 +3786,7 @@ def build_everything():
                 cycling_infra=row.get("Separated Cycling Infrastructure", ""),
                 bridge=row.get("Bridge", ""),
                 school_zones=row.get("School Loading Zones", ""),
+                layby_parking=row.get("Layby Parking", ""),
                 equipment=row.get("Equipment Method", ""),
                 contractor_toa=row.get("Contractor: Crew TOA Area Responsibility", ""),
                 crew_type=row.get("Snow Removal by Contracted Crew or In-House?", ""),
@@ -3851,10 +3875,39 @@ def build_everything():
         log(f"Map saved: {OUTPUT_HTML}")
 
         if geojson_features:
-            feature_collection = {"type": "FeatureCollection", "features": geojson_features}
+            # Filter to only include work order lines (not individual segments) for ArcGIS export
+            workorder_lines_only = [
+                f for f in geojson_features 
+                if f.get("properties", {}).get("Feature_Type") == "workorder_line"
+            ]
+            
+            # Remove internal attributes from GeoJSON output
+            attrs_to_exclude = [
+                "Street_Normalized",
+                "From_Normalized", 
+                "To_Normalized",
+                "Shift_Time",
+                "Shift_Date",
+                "Line_Color"
+            ]
+            
+            # Clean features for export
+            cleaned_features = []
+            for feature in workorder_lines_only:
+                cleaned_feature = {
+                    "type": feature["type"],
+                    "geometry": feature["geometry"],
+                    "properties": {
+                        k: v for k, v in feature["properties"].items() 
+                        if k not in attrs_to_exclude
+                    }
+                }
+                cleaned_features.append(cleaned_feature)
+            
+            feature_collection = {"type": "FeatureCollection", "features": cleaned_features}
             with open(OUTPUT_GEOJSON, "w", encoding="utf-8") as f:
                 json.dump(feature_collection, f)
-            log(f"GeoJSON saved: {OUTPUT_GEOJSON}")
+            log(f"GeoJSON saved: {OUTPUT_GEOJSON} ({len(cleaned_features)} work order lines)")
 
         if mapped_records:
             pd.DataFrame(mapped_records).to_csv(OUTPUT_MAPPED_CSV, index=False)
@@ -4139,8 +4192,8 @@ INDEX_HTML = """
       <a class="btn" href="/new">+ Add a New Work Order </a>
     </p>
     <p class="muted">
-      Debug:
-      <a href="/outputs/intake_submissions_debug.csv" target="_blank" rel="noopener noreferrer">intake_submissions_debug.csv</a>
+      Download:
+      <a href="/outputs/work_orders.geojson" target="_blank" rel="noopener noreferrer">work_orders.geojson</a>
     </p>
   </div>
 </body>
@@ -4346,7 +4399,7 @@ NEW_FORM_HTML = """
     table:not(#woTable) tbody td:nth-child(3)::before{ content:"District"; }
     table:not(#woTable) tbody td:nth-child(4)::before{ content:"Ward"; }
     table:not(#woTable) tbody td:nth-child(5)::before{ content:"TOA Area"; }
-    table:not(#woTable) tbody td:nth-child(6)::before{ content:"Supervisor"; }
+    table:not(#woTable) tbody td:nth-child(6)::before{ content:"Supervisor(s)"; }
     table:not(#woTable) tbody td:nth-child(7)::before{ content:"Shift"; }
     table:not(#woTable) tbody td:nth-child(8)::before{ content:"Street"; }
     table:not(#woTable) tbody td:nth-child(9)::before{ content:"From"; }
@@ -4358,27 +4411,28 @@ NEW_FORM_HTML = """
     table:not(#woTable) tbody td:nth-child(15)::before{ content:"Cycling"; }
     table:not(#woTable) tbody td:nth-child(16)::before{ content:"Bridge"; }
     table:not(#woTable) tbody td:nth-child(17)::before{ content:"School Zones"; }
-    table:not(#woTable) tbody td:nth-child(18)::before{ content:"Equipment"; }
-    table:not(#woTable) tbody td:nth-child(19)::before{ content:"Dump Trucks"; }
-    table:not(#woTable) tbody td:nth-child(20)::before{ content:"Source"; }
-    table:not(#woTable) tbody td:nth-child(21)::before{ content:"Contractor TOA"; }
-    table:not(#woTable) tbody td:nth-child(22)::before{ content:"Snow Dump Site"; }
-    table:not(#woTable) tbody td:nth-child(23)::before{ content:"Loads"; }
-    table:not(#woTable) tbody td:nth-child(24)::before{ content:"Tonnes"; }
-    table:not(#woTable) tbody td:nth-child(25)::before{ content:"Crew Type"; }
-    table:not(#woTable) tbody td:nth-child(26)::before{ content:"# Crews"; }
-    table:not(#woTable) tbody td:nth-child(27)::before{ content:"Crew Number"; }
-    table:not(#woTable) tbody td:nth-child(28)::before{ content:"In-House Base"; }
-    table:not(#woTable) tbody td:nth-child(29)::before{ content:"# Staff"; }
-    table:not(#woTable) tbody td:nth-child(30)::before{ content:"Notes"; }
-    table:not(#woTable) tbody td:nth-child(31)::before{ content:"Status"; }
-    table:not(#woTable) tbody td:nth-child(32)::before{ content:"Edit"; }
+    table:not(#woTable) tbody td:nth-child(18)::before{ content:"Layby Parking"; }
+    table:not(#woTable) tbody td:nth-child(19)::before{ content:"Equipment"; }
+    table:not(#woTable) tbody td:nth-child(20)::before{ content:"Dump Trucks"; }
+    table:not(#woTable) tbody td:nth-child(21)::before{ content:"Source"; }
+    table:not(#woTable) tbody td:nth-child(22)::before{ content:"Contractor TOA"; }
+    table:not(#woTable) tbody td:nth-child(23)::before{ content:"Snow Dump Site"; }
+    table:not(#woTable) tbody td:nth-child(24)::before{ content:"Loads"; }
+    table:not(#woTable) tbody td:nth-child(25)::before{ content:"Tonnes"; }
+    table:not(#woTable) tbody td:nth-child(26)::before{ content:"Crew Type"; }
+    table:not(#woTable) tbody td:nth-child(27)::before{ content:"# Crews"; }
+    table:not(#woTable) tbody td:nth-child(28)::before{ content:"Crew Number"; }
+    table:not(#woTable) tbody td:nth-child(29)::before{ content:"In-House Base"; }
+    table:not(#woTable) tbody td:nth-child(30)::before{ content:"# Staff"; }
+    table:not(#woTable) tbody td:nth-child(31)::before{ content:"Notes"; }
+    table:not(#woTable) tbody td:nth-child(32)::before{ content:"Status"; }
+    table:not(#woTable) tbody td:nth-child(33)::before{ content:"Edit"; }
 
     /* ✅ Make long text fields span full width */
     table:not(#woTable) tbody td:nth-child(8),   /* Street */
     table:not(#woTable) tbody td:nth-child(9),   /* From */
     table:not(#woTable) tbody td:nth-child(10),  /* To */
-    table:not(#woTable) tbody td:nth-child(30){  /* Notes */
+    table:not(#woTable) tbody td:nth-child(31){  /* Notes */
     grid-column: 1 / -1;
     }
 
@@ -4436,34 +4490,35 @@ NEW_FORM_HTML = """
     #woTable tbody td:nth-child(12)::before{ content:"Separated Cycling Infrastructure"; }
     #woTable tbody td:nth-child(13)::before{ content:"Bridge"; }
     #woTable tbody td:nth-child(14)::before{ content:"School Loading Zones"; }
-    #woTable tbody td:nth-child(15)::before{ content:"Equipment Method"; }
-    #woTable tbody td:nth-child(16)::before{ content:"# of Equipment (Dump Trucks)"; }
-    #woTable tbody td:nth-child(17)::before{ content:"Dump Truck Source (In-House/Contractor)"; }
-    #woTable tbody td:nth-child(18)::before{ content:"Snow Dump Site"; }
-    #woTable tbody td:nth-child(19)::before{ content:"# of Loads"; }
-    #woTable tbody td:nth-child(20)::before{ content:"Tonnes"; }
-    #woTable tbody td:nth-child(21)::before{ content:"Shift Start Date"; }
-    #woTable tbody td:nth-child(22)::before{ content:"Shift Start Time"; }
-    #woTable tbody td:nth-child(23)::before{ content:"Shift End Date"; }
-    #woTable tbody td:nth-child(24)::before{ content:"Shift End Time"; }
-    #woTable tbody td:nth-child(25)::before{ content:"Supervisor 1"; }
-    #woTable tbody td:nth-child(26)::before{ content:"Supervisor 2 (if relevant)"; }
-    #woTable tbody td:nth-child(27)::before{ content:"Supervisor 3 (if relevant)"; }
-    #woTable tbody td:nth-child(28)::before{ content:"Snow Removal by Contracted Crew or In-House?"; }
-    #woTable tbody td:nth-child(29)::before{ content:"Contractor: # of Crews"; }
-    #woTable tbody td:nth-child(30)::before{ content:"Contractor: Crew TOA Area Responsibility"; }
-    #woTable tbody td:nth-child(31)::before{ content:"Contractor: Crew Number"; }
-    #woTable tbody td:nth-child(32)::before{ content:"In-House: Staff Responsibility (Base Yard)"; }
-    #woTable tbody td:nth-child(33)::before{ content:"In-House: # of Staff"; }
-    #woTable tbody td:nth-child(34)::before{ content:"NOTES"; }
-    #woTable tbody td:nth-child(35)::before{ content:"Remove"; }
+    #woTable tbody td:nth-child(15)::before{ content:"Layby Parking"; }
+    #woTable tbody td:nth-child(16)::before{ content:"Equipment Method"; }
+    #woTable tbody td:nth-child(17)::before{ content:"# of Equipment (Dump Trucks)"; }
+    #woTable tbody td:nth-child(18)::before{ content:"Dump Truck Source (In-House/Contractor)"; }
+    #woTable tbody td:nth-child(19)::before{ content:"Snow Dump Site"; }
+    #woTable tbody td:nth-child(20)::before{ content:"# of Loads"; }
+    #woTable tbody td:nth-child(21)::before{ content:"Tonnes"; }
+    #woTable tbody td:nth-child(22)::before{ content:"Shift Start Date"; }
+    #woTable tbody td:nth-child(23)::before{ content:"Shift Start Time"; }
+    #woTable tbody td:nth-child(24)::before{ content:"Shift End Date"; }
+    #woTable tbody td:nth-child(25)::before{ content:"Shift End Time"; }
+    #woTable tbody td:nth-child(26)::before{ content:"Supervisor 1"; }
+    #woTable tbody td:nth-child(27)::before{ content:"Supervisor 2 (if relevant)"; }
+    #woTable tbody td:nth-child(28)::before{ content:"Supervisor 3 (if relevant)"; }
+    #woTable tbody td:nth-child(29)::before{ content:"Snow Removal by Contracted Crew or In-House?"; }
+    #woTable tbody td:nth-child(30)::before{ content:"Contractor: # of Crews"; }
+    #woTable tbody td:nth-child(31)::before{ content:"Contractor: Crew TOA Area Responsibility"; }
+    #woTable tbody td:nth-child(32)::before{ content:"Contractor: Crew Number"; }
+    #woTable tbody td:nth-child(33)::before{ content:"In-House: Staff Responsibility (Base Yard)"; }
+    #woTable tbody td:nth-child(34)::before{ content:"In-House: # of Staff"; }
+    #woTable tbody td:nth-child(35)::before{ content:"NOTES"; }
+    #woTable tbody td:nth-child(36)::before{ content:"Remove"; }
 
     /* Spans / sizing (optional but recommended) */
     #woTable tbody td:nth-child(1){ grid-column: span 2; }      /* WO bigger */
     #woTable tbody td:nth-child(5){ grid-column: span 2; }      /* Street bigger */
-    #woTable tbody td:nth-child(15){ grid-column: span 2; }     /* Equipment Method bigger */
-    #woTable tbody td:nth-child(30){ grid-column: span 2; }     /* Crew responsibility bigger */
-    #woTable tbody td:nth-child(34){ grid-column: 1 / -1; }     /* NOTES full width */
+    #woTable tbody td:nth-child(16){ grid-column: span 2; }     /* Equipment Method bigger */
+    #woTable tbody td:nth-child(31){ grid-column: span 2; }     /* Crew responsibility bigger */
+    #woTable tbody td:nth-child(35){ grid-column: 1 / -1; }     /* NOTES full width */
 
     #woTable tbody td:nth-child(5),
     #woTable tbody td:nth-child(6),
@@ -4647,7 +4702,7 @@ NEW_FORM_HTML = """
         <th>District</th>
         <th>Ward</th>
         <th>TOA Area</th>
-        <th>Supervisor</th>
+        <th>Supervisor(s)</th>
         <th>Shift</th>
         <th>Street</th>
         <th>From Intersection</th>
@@ -4659,6 +4714,7 @@ NEW_FORM_HTML = """
         <th>Cycling</th>
         <th>Bridge</th>
         <th>School Zones</th>
+        <th>Layby Parking</th>
         <th>Equipment Method</th>
         <th>Dump Trucks</th>
         <th>Dump Truck Source</th>
@@ -4666,7 +4722,7 @@ NEW_FORM_HTML = """
         <th>Snow Dump Site</th>
         <th>Loads</th>
         <th>Tonnes</th>
-        <th>Crew Type</th>
+        <th>Snow Removal by...</th>
         <th># Crews</th>
         <th>Crew Number</th>
         <th>In-House Base</th>
@@ -4684,8 +4740,8 @@ NEW_FORM_HTML = """
         <td>{{ r.get('District (Where Snow Removed)','') }}</td>
         <td>{{ r.get('Ward (Where Snow Removed)','') }}</td>
         <td>{{ r.get('TOA Area (Where Snow Removed)','') }}</td>
-        <td>{{ r.get('Supervisor 1','') }}</td>
-        <td>{{ r.get('Shift Start Time','') }} - {{ r.get('Shift End Time','') }}</td>
+        <td>{{ r.get('Supervisor 1','') }}{% if r.get('Supervisor 2 (if relevant)','') %}<br>{{ r.get('Supervisor 2 (if relevant)','') }}{% endif %}{% if r.get('Supervisor 3 (if relevant)','') %}<br>{{ r.get('Supervisor 3 (if relevant)','') }}{% endif %}</td>
+        <td>{{ r.get('Shift Start Date','') }} {{ r.get('Shift Start Time','') }}<br>{{ r.get('Shift End Date','') }} {{ r.get('Shift End Time','') }}</td>
         <td>{{ r.get('Street','') }}</td>
         <td>{{ r.get('From Intersection','') }}</td>
         <td>{{ r.get('To Intersection','') }}</td>
@@ -4696,6 +4752,7 @@ NEW_FORM_HTML = """
         <td>{{ r.get('Separated Cycling Infrastructure','') }}</td>
         <td>{{ r.get('Bridge','') }}</td>
         <td>{{ r.get('School Loading Zones','') }}</td>
+        <td>{{ r.get('Layby Parking','') }}</td>
         <td>{{ r.get('Equipment Method','') }}</td>
         <td>{{ r.get('# of Equipment (Dump Trucks)','') }}</td>
         <td>{{ r.get('Dump Truck Source (In-House/Contractor)','') }}</td>
@@ -4805,6 +4862,7 @@ NEW_FORM_HTML = """
 <script>
 (function(){
   var districts = {{ districts_json | safe }};
+  var supervisors = {{ supervisors_json | safe }};
   var districtToWards = {{ district_to_wards_json | safe }};
   var shifts = {{ shifts_json | safe }};
   var types = {{ types_json | safe }};
@@ -4948,6 +5006,7 @@ NEW_FORM_HTML = """
         + '<td>' + yesNoSelectHtml('Separated Cycling Infrastructure_' + idx) + '</td>'
         + '<td>' + yesNoSelectHtml('Bridge_' + idx) + '</td>'
         + '<td>' + yesNoSelectHtml('School Loading Zones_' + idx) + '</td>'
+        + '<td>' + yesNoSelectHtml('Layby Parking_' + idx) + '</td>'
 
         + '<td>' + typeSelectHtml('Equipment Method_' + idx) + '</td>'
 
@@ -4968,13 +5027,13 @@ NEW_FORM_HTML = """
         + '<td><input type="date" name="Shift End Date_' + idx + '" value="' + escapeHtml(prefill["Shift End Date"] || "") + '"></td>'
         + '<td><input type="time" name="Shift End Time_' + idx + '" required value="' + escapeHtml(prefill["Shift End Time"] || "") + '"></td>'
 
-        + '<td><input name="Supervisor 1_' + idx + '" list="supervisors_list" required placeholder="Supervisor 1" value="' + escapeHtml(prefill["Supervisor 1"] || "") + '"></td>'
-        + '<td><input name="Supervisor 2 (if relevant)_' + idx + '" placeholder="Supervisor 2" value="' + escapeHtml(prefill["Supervisor 2 (if relevant)"] || "") + '"></td>'
-        + '<td><input name="Supervisor 3 (if relevant)_' + idx + '" placeholder="Supervisor 3" value="' + escapeHtml(prefill["Supervisor 3 (if relevant)"] || "") + '"></td>'
+        + '<td><select class="sup1" name="Supervisor 1_' + idx + '" required><option value="">-- Select Supervisor 1 --</option>' + optList(supervisors) + '</select></td>'
+        + '<td><select class="sup2" name="Supervisor 2 (if relevant)_' + idx + '"><option value="">-- Select Supervisor 2 --</option></select></td>'
+        + '<td><select class="sup3" name="Supervisor 3 (if relevant)_' + idx + '"><option value="">-- Select Supervisor 3 --</option></select></td>'
 
         + '<td>' + simpleSelectHtml('Snow Removal by Contracted Crew or In-House?_' + idx, ['Contracted Crew','In-House']) + '</td>'
 
-        + '<td><input name="Contractor: # of Crews_' + idx + '" placeholder="e.g. 2" value="' + escapeHtml(prefill["Contractor: # of Crews"] || "") + '"></td>'
+        + '<td><input name="Contractor: # of Crews_' + idx + '" type="number" min="0" placeholder="e.g. 2" value="' + escapeHtml(prefill["Contractor: # of Crews"] || "") + '"></td>'
 
         + '<td><select name="Contractor: Crew TOA Area Responsibility_' + idx + '">'
         +   '<option value="">--</option>'
@@ -4991,6 +5050,52 @@ NEW_FORM_HTML = """
         + '<td><button type="button" class="ghost rmBtn">Remove</button></td>';
 
     tbody.appendChild(tr);
+
+    // ✅ Set prefill values for select dropdowns
+    if (prefill) {
+        // Yes/No fields
+        var yesNoFields = ['Roadway', 'Sidewalk', 'Separated Cycling Infrastructure', 'Bridge', 'School Loading Zones', 'Layby Parking'];
+        yesNoFields.forEach(function(field){
+            var val = prefill[field];
+            if (val) {
+                var sel = tr.querySelector('select[name="' + field + '_' + idx + '"]');
+                if (sel) sel.value = String(val);
+            }
+        });
+        
+        // Equipment Method
+        if (prefill["Equipment Method"]) {
+            var typeSel = tr.querySelector('select[name="Equipment Method_' + idx + '"]');
+            if (typeSel) typeSel.value = String(prefill["Equipment Method"]);
+        }
+        
+        // Other select fields
+        var selectFields = [
+            'One Side / Both Sides Cleared?',
+            'Side of Road Cleared',
+            'Dump Truck Source (In-House/Contractor)',
+            'Snow Removal by Contracted Crew or In-House?'
+        ];
+        selectFields.forEach(function(field){
+            var val = prefill[field];
+            if (val) {
+                var sel = tr.querySelector('select[name="' + field + '_' + idx + '"]');
+                if (sel) sel.value = String(val);
+            }
+        });
+        
+        // Snow Dump Site
+        if (prefill["Snow Dump Site"]) {
+            var snowSel = tr.querySelector('select[name="Snow Dump Site_' + idx + '"]');
+            if (snowSel) snowSel.value = String(prefill["Snow Dump Site"]);
+        }
+        
+        // Contractor TOA
+        if (prefill["Contractor: Crew TOA Area Responsibility"]) {
+            var crewSel = tr.querySelector('select[name="Contractor: Crew TOA Area Responsibility_' + idx + '"]');
+            if (crewSel) crewSel.value = String(prefill["Contractor: Crew TOA Area Responsibility"]);
+        }
+    }
 
     // ✅ Remove row
     tr.querySelector('.rmBtn').onclick = function(){
@@ -5012,6 +5117,19 @@ NEW_FORM_HTML = """
         });
     }
     dsel.addEventListener('change', function(){ setWards(dsel.value); });
+    
+    // Set prefilled district/ward/TOA values
+    if (prefill["District (Where Snow Removed)"]) {
+        dsel.value = prefill["District (Where Snow Removed)"];
+        setWards(dsel.value);
+        if (prefill["Ward (Where Snow Removed)"]) {
+            wsel.value = prefill["Ward (Where Snow Removed)"];
+        }
+    }
+    var toaSel = tr.querySelector('.toaSel');
+    if (toaSel && prefill["TOA Area (Where Snow Removed)"]) {
+        toaSel.value = prefill["TOA Area (Where Snow Removed)"];
+    }
 
     // ✅ Street → cross streets
     var streetIn = tr.querySelector('.streetIn');
@@ -5045,6 +5163,43 @@ NEW_FORM_HTML = """
     fromIn.addEventListener('change', function(){
         populateDatalist(dlTo, cachedCross, fromIn.value);
     });
+
+    // ✅ Supervisor deduplication for SELECT dropdowns
+    var sup1 = tr.querySelector('.sup1');
+    var sup2 = tr.querySelector('.sup2');
+    var sup3 = tr.querySelector('.sup3');
+
+    function refreshSupervisorLists(){
+        var sup1Val = (sup1.value || '').trim();
+        var sup2Val = (sup2.value || '').trim();
+        var sup3Val = (sup3.value || '').trim();
+        
+        // Supervisor 2: exclude Supervisor 1
+        var sup2Options = supervisors.filter(function(s){ return s !== sup1Val; });
+        sup2.innerHTML = '<option value="">-- Select Supervisor 2 --</option>' + optList(sup2Options);
+        if (sup2Val && sup2Options.includes(sup2Val)) {
+            sup2.value = sup2Val;
+        }
+        
+        // Supervisor 3: exclude both Supervisor 1 and 2
+        var excluded = [sup1Val, sup2Val].filter(function(v){ return v; });
+        var sup3Options = supervisors.filter(function(s){ return !excluded.includes(s); });
+        sup3.innerHTML = '<option value="">-- Select Supervisor 3 --</option>' + optList(sup3Options);
+        if (sup3Val && sup3Options.includes(sup3Val)) {
+            sup3.value = sup3Val;
+        }
+    }
+
+    sup1.addEventListener('change', refreshSupervisorLists);
+    sup2.addEventListener('change', refreshSupervisorLists);
+    
+    // Set prefill values
+    if (prefill["Supervisor 1"]) sup1.value = prefill["Supervisor 1"];
+    if (prefill["Supervisor 2 (if relevant)"]) sup2.value = prefill["Supervisor 2 (if relevant)"];
+    if (prefill["Supervisor 3 (if relevant)"]) sup3.value = prefill["Supervisor 3 (if relevant)"];
+    
+    // Initial population
+    refreshSupervisorLists();
   }
 
 
@@ -5416,34 +5571,35 @@ EDIT_FORM_HTML = """
     #woTable tbody td:nth-child(12)::before{ content:"Separated Cycling Infrastructure"; }
     #woTable tbody td:nth-child(13)::before{ content:"Bridge"; }
     #woTable tbody td:nth-child(14)::before{ content:"School Loading Zones"; }
-    #woTable tbody td:nth-child(15)::before{ content:"Equipment Method"; }
-    #woTable tbody td:nth-child(16)::before{ content:"# of Equipment (Dump Trucks)"; }
-    #woTable tbody td:nth-child(17)::before{ content:"Dump Truck Source (In-House/Contractor)"; }
-    #woTable tbody td:nth-child(18)::before{ content:"Snow Dump Site"; }
-    #woTable tbody td:nth-child(19)::before{ content:"# of Loads"; }
-    #woTable tbody td:nth-child(20)::before{ content:"Tonnes"; }
-    #woTable tbody td:nth-child(21)::before{ content:"Shift Start Date"; }
-    #woTable tbody td:nth-child(22)::before{ content:"Shift Start Time"; }
-    #woTable tbody td:nth-child(23)::before{ content:"Shift End Date"; }
-    #woTable tbody td:nth-child(24)::before{ content:"Shift End Time"; }
-    #woTable tbody td:nth-child(25)::before{ content:"Supervisor 1"; }
-    #woTable tbody td:nth-child(26)::before{ content:"Supervisor 2 (if relevant)"; }
-    #woTable tbody td:nth-child(27)::before{ content:"Supervisor 3 (if relevant)"; }
-    #woTable tbody td:nth-child(28)::before{ content:"Snow Removal by Contracted Crew or In-House?"; }
-    #woTable tbody td:nth-child(29)::before{ content:"Contractor: # of Crews"; }
-    #woTable tbody td:nth-child(30)::before{ content:"Contractor: Crew TOA Area Responsibility"; }
-    #woTable tbody td:nth-child(31)::before{ content:"Contractor: Crew Number"; }
-    #woTable tbody td:nth-child(32)::before{ content:"In-House: Staff Responsibility (Base Yard)"; }
-    #woTable tbody td:nth-child(33)::before{ content:"In-House: # of Staff"; }
-    #woTable tbody td:nth-child(34)::before{ content:"NOTES"; }
+    #woTable tbody td:nth-child(15)::before{ content:"Layby Parking"; }
+    #woTable tbody td:nth-child(16)::before{ content:"Equipment Method"; }
+    #woTable tbody td:nth-child(17)::before{ content:"# of Equipment (Dump Trucks)"; }
+    #woTable tbody td:nth-child(18)::before{ content:"Dump Truck Source (In-House/Contractor)"; }
+    #woTable tbody td:nth-child(19)::before{ content:"Snow Dump Site"; }
+    #woTable tbody td:nth-child(20)::before{ content:"# of Loads"; }
+    #woTable tbody td:nth-child(21)::before{ content:"Tonnes"; }
+    #woTable tbody td:nth-child(22)::before{ content:"Shift Start Date"; }
+    #woTable tbody td:nth-child(23)::before{ content:"Shift Start Time"; }
+    #woTable tbody td:nth-child(24)::before{ content:"Shift End Date"; }
+    #woTable tbody td:nth-child(25)::before{ content:"Shift End Time"; }
+    #woTable tbody td:nth-child(26)::before{ content:"Supervisor 1"; }
+    #woTable tbody td:nth-child(27)::before{ content:"Supervisor 2 (if relevant)"; }
+    #woTable tbody td:nth-child(28)::before{ content:"Supervisor 3 (if relevant)"; }
+    #woTable tbody td:nth-child(29)::before{ content:"Snow Removal by Contracted Crew or In-House?"; }
+    #woTable tbody td:nth-child(30)::before{ content:"Contractor: # of Crews"; }
+    #woTable tbody td:nth-child(31)::before{ content:"Contractor: Crew TOA Area Responsibility"; }
+    #woTable tbody td:nth-child(32)::before{ content:"Contractor: Crew Number"; }
+    #woTable tbody td:nth-child(33)::before{ content:"In-House: Staff Responsibility (Base Yard)"; }
+    #woTable tbody td:nth-child(34)::before{ content:"In-House: # of Staff"; }
+    #woTable tbody td:nth-child(35)::before{ content:"NOTES"; }
 
     /* Spans / sizing */
     #woTable tbody td:nth-child(1){ grid-column: span 2; }
     #woTable tbody td:nth-child(5){ grid-column: span 2; }
     #woTable tbody td:nth-child(15){ grid-column: span 2; }
-    #woTable tbody td:nth-child(30){ grid-column: span 2; }
+    #woTable tbody td:nth-child(31){ grid-column: span 2; }
 
-    #woTable tbody td:nth-child(34){ grid-column: 1 / -1; } /* NOTES full width */
+    #woTable tbody td:nth-child(35){ grid-column: 1 / -1; } /* NOTES full width */
     #woTable tbody td:nth-child(5),
     #woTable tbody td:nth-child(6),
     #woTable tbody td:nth-child(7){
@@ -5561,6 +5717,7 @@ EDIT_FORM_HTML = """
 <script>
 (function(){
   var districts = {{ districts_json | safe }};
+  var supervisors = {{ supervisors_json | safe }};
   var districtToWards = {{ district_to_wards_json | safe }};
   var types = {{ types_json | safe }};
   var dumpTruckProvidersOptions = {{ dump_truck_providers_html | tojson | safe }};
@@ -5661,6 +5818,11 @@ EDIT_FORM_HTML = """
 
   // --- Build ONE edit row in the same order as your Excel schema ---
   var row = {{ row_json | safe }};
+  console.log("Edit form row data:", row);
+  console.log("Shift Start Date:", row["Shift Start Date"]);
+  console.log("Shift End Date:", row["Shift End Date"]);
+  console.log("Supervisor 2:", row["Supervisor 2 (if relevant)"]);
+  console.log("Supervisor 3:", row["Supervisor 3 (if relevant)"]);
 
   var tr = document.createElement('tr');
   tr.innerHTML =
@@ -5679,6 +5841,7 @@ EDIT_FORM_HTML = """
     + '<td>' + yesNoSelect('Separated Cycling Infrastructure', row["Separated Cycling Infrastructure"]||"") + '</td>'
     + '<td>' + yesNoSelect('Bridge', row["Bridge"]||"") + '</td>'
     + '<td>' + yesNoSelect('School Loading Zones', row["School Loading Zones"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Layby Parking', row["Layby Parking"]||"") + '</td>'
     + '<td><select name="Equipment Method" required><option value="">--</option>' + optList(types) + '</select></td>'
     + '<td><input name="# of Equipment (Dump Trucks)" type="number" min="0" value="' + escapeHtml(row["# of Equipment (Dump Trucks)"]||"") + '"></td>'
     + '<td>' + simpleSelect('Dump Truck Source (In-House/Contractor)', ['In-House','Contractor'], row["Dump Truck Source (In-House/Contractor)"]||"") + '</td>'
@@ -5689,11 +5852,11 @@ EDIT_FORM_HTML = """
     + '<td><input type="time" name="Shift Start Time" required value="' + escapeHtml(row["Shift Start Time"]||"") + '"></td>'
     + '<td><input type="date" name="Shift End Date" value="' + escapeHtml(row["Shift End Date"]||"") + '"></td>'
     + '<td><input type="time" name="Shift End Time" required value="' + escapeHtml(row["Shift End Time"]||"") + '"></td>'
-    + '<td><input name="Supervisor 1" list="supervisors_list" required value="' + escapeHtml(row["Supervisor 1"]||"") + '"></td>'
-    + '<td><input name="Supervisor 2 (if relevant)" value="' + escapeHtml(row["Supervisor 2 (if relevant)"]||"") + '"></td>'
-    + '<td><input name="Supervisor 3 (if relevant)" value="' + escapeHtml(row["Supervisor 3 (if relevant)"]||"") + '"></td>'
+    + '<td><select class="sup1" name="Supervisor 1" required><option value="">-- Select Supervisor 1 --</option>' + optList(supervisors) + '</select></td>'
+    + '<td><select class="sup2" name="Supervisor 2 (if relevant)"><option value="">-- Select Supervisor 2 --</option></select></td>'
+    + '<td><select class="sup3" name="Supervisor 3 (if relevant)"><option value="">-- Select Supervisor 3 --</option></select></td>'
     + '<td>' + simpleSelect('Snow Removal by Contracted Crew or In-House?', ['Contracted Crew','In-House'], row["Snow Removal by Contracted Crew or In-House?"]||"") + '</td>'
-    + '<td><input name="Contractor: # of Crews" value="' + escapeHtml(row["Contractor: # of Crews"]||"") + '"></td>'
+    + '<td><input name="Contractor: # of Crews" type="number" min="0" value="' + escapeHtml(row["Contractor: # of Crews"]||"") + '"></td>'
     + '<td><select name="Contractor: Crew TOA Area Responsibility"><option value="">--</option>' + dumpTruckProvidersOptions + '</select></td>'
     + '<td><input name="Contractor: Crew Number" value="' + escapeHtml(row["Contractor: Crew Number"]||"") + '"></td>'
     + '<td><input name="In-House: Staff Responsibility (Base Yard)" value="' + escapeHtml(row["In-House: Staff Responsibility (Base Yard)"]||"") + '"></td>'
@@ -5772,6 +5935,76 @@ EDIT_FORM_HTML = """
   fromIn.addEventListener('change', function(){ populateDatalist(dlTo, cachedCross, fromIn.value); });
 
   refreshCrossLists();
+
+  // ✅ Supervisor deduplication for SELECT dropdowns
+  var sup1 = document.querySelector('.sup1');
+  var sup2 = document.querySelector('.sup2');
+  var sup3 = document.querySelector('.sup3');
+
+  function refreshSupervisorLists(){
+    var sup1Val = (sup1.value || '').trim();
+    var sup2Val = (sup2.value || '').trim();
+    var sup3Val = (sup3.value || '').trim();
+    
+    // Supervisor 2: exclude Supervisor 1
+    var sup2Options = supervisors.filter(function(s){ return s !== sup1Val; });
+    sup2.innerHTML = '<option value="">-- Select Supervisor 2 --</option>' + optList(sup2Options);
+    if (sup2Val && sup2Options.includes(sup2Val)) {
+      sup2.value = sup2Val;
+    }
+    
+    // Supervisor 3: exclude both Supervisor 1 and 2
+    var excluded = [sup1Val, sup2Val].filter(function(v){ return v; });
+    var sup3Options = supervisors.filter(function(s){ return !excluded.includes(s); });
+    sup3.innerHTML = '<option value="">-- Select Supervisor 3 --</option>' + optList(sup3Options);
+    if (sup3Val && sup3Options.includes(sup3Val)) {
+      sup3.value = sup3Val;
+    }
+  }
+
+  sup1.addEventListener('change', refreshSupervisorLists);
+  sup2.addEventListener('change', refreshSupervisorLists);
+  
+  // Store target values from row data BEFORE any refresh
+  var targetSup1 = String(row["Supervisor 1"]||"");
+  var targetSup2 = String(row["Supervisor 2 (if relevant)"]||"");
+  var targetSup3 = String(row["Supervisor 3 (if relevant)"]||"");
+  
+  // Set sup1 first
+  if (targetSup1) {
+    sup1.value = targetSup1;
+  }
+  
+  // Now refresh to populate sup2 and sup3 options based on sup1
+  refreshSupervisorLists();
+  
+  // After refresh, set sup2 and sup3 values
+  // Check if the value exists in the dropdown before setting
+  if (targetSup2) {
+    var foundSup2 = false;
+    for (var i = 0; i < sup2.options.length; i++) {
+      if (sup2.options[i].value === targetSup2) {
+        foundSup2 = true;
+        break;
+      }
+    }
+    if (foundSup2) {
+      sup2.value = targetSup2;
+    }
+  }
+  
+  if (targetSup3) {
+    var foundSup3 = false;
+    for (var i = 0; i < sup3.options.length; i++) {
+      if (sup3.options[i].value === targetSup3) {
+        foundSup3 = true;
+        break;
+      }
+    }
+    if (foundSup3) {
+      sup3.value = targetSup3;
+    }
+  }
 })();
 </script>
 
@@ -6001,6 +6234,7 @@ def new_form():
             f"<option>{html.escape(x)}</option>" for x in SNOW_DUMP_SITES
         ),        
         districts_json=json.dumps(DISTRICTS),
+        supervisors_json=json.dumps(latest_allowed_sets.get("Supervisor 1", [])),
         shifts_json=json.dumps((STRICT_SHIFTS[:] if STRICT_SHIFTS else [])),
         types_json=json.dumps((STRICT_TYPES[:] if STRICT_TYPES else [])),
         street_endpoints_json=json.dumps(street_endpoints, ensure_ascii=False),
@@ -6061,14 +6295,15 @@ def new_submit():
         values["One Side / Both Sides Cleared?"] = g("One Side / Both Sides Cleared?")
         values["Side of Road Cleared"] = g("Side of Road Cleared")
 
-        # 10-14 Yes/No fields
+        # 10-15 Yes/No fields
         values["Roadway"] = g("Roadway")
         values["Sidewalk"] = g("Sidewalk")
         values["Separated Cycling Infrastructure"] = g("Separated Cycling Infrastructure")
         values["Bridge"] = g("Bridge")
         values["School Loading Zones"] = g("School Loading Zones")
+        values["Layby Parking"] = g("Layby Parking")
 
-        # 15-20
+        # 16-21
         values["Equipment Method"] = g("Equipment Method")
         values["# of Equipment (Dump Trucks)"] = g("# of Equipment (Dump Trucks)")
         values["Dump Truck Source (In-House/Contractor)"] = g("Dump Truck Source (In-House/Contractor)")
@@ -6076,11 +6311,11 @@ def new_submit():
         values["# of Loads"] = g("# of Loads")
         values["Tonnes"] = g("Tonnes")
 
-        # 21-24 Shift
-        values["Shift Start Date"] = format_date_from_picker(g("Shift Start Date"))
+        # 21-24 Shift - Keep dates in YYYY-MM-DD format for HTML date inputs
+        values["Shift Start Date"] = g("Shift Start Date")
         values["Shift Start Time"] = g("Shift Start Time")
 
-        _end_date = format_date_from_picker(g("Shift End Date"))
+        _end_date = g("Shift End Date")
         values["Shift End Date"] = _end_date if _end_date else values["Shift Start Date"]
         values["Shift End Time"] = g("Shift End Time")
 
@@ -6196,24 +6431,41 @@ def new_submit():
             # JS expects these keys (WO/District/Ward/Date/Shift/Supervisor/Street/FromIntersection/ToIntersection...) for repopulating the row grid.
             sh = normalize_shift_time_range("", v.get("Shift Start Time", ""), v.get("Shift End Time", ""))
             prefill_rows.append({
-                "WO": v.get("Work Order Number", ""),
-                "District": v.get("District (Where Snow Removed)", ""),
-                "Ward": v.get("Ward (Where Snow Removed)", ""),
-                "Date": v.get("Shift Start Date", ""),
-                "Shift": sh,
-                "Supervisor": v.get("Supervisor 1", ""),
+                "Work Order Number": v.get("Work Order Number", ""),
+                "District (Where Snow Removed)": v.get("District (Where Snow Removed)", ""),
+                "Ward (Where Snow Removed)": v.get("Ward (Where Snow Removed)", ""),
+                "TOA Area (Where Snow Removed)": v.get("TOA Area (Where Snow Removed)", ""),
                 "Street": v.get("Street", ""),
-                "FromIntersection": v.get("From Intersection", ""),
-                "ToIntersection": v.get("To Intersection", ""),
-                "Type": v.get("Equipment Method", ""),
-                "DumpTrucks": v.get("# of Equipment (Dump Trucks)", ""),
-                "Provider": "",  # stored in NOTES if provided
-                "Loads": v.get("# of Loads", ""),
+                "From Intersection": v.get("From Intersection", ""),
+                "To Intersection": v.get("To Intersection", ""),
+                "One Side / Both Sides Cleared?": v.get("One Side / Both Sides Cleared?", ""),
+                "Side of Road Cleared": v.get("Side of Road Cleared", ""),
+                "Roadway": v.get("Roadway", ""),
+                "Sidewalk": v.get("Sidewalk", ""),
+                "Separated Cycling Infrastructure": v.get("Separated Cycling Infrastructure", ""),
+                "Bridge": v.get("Bridge", ""),
+                "School Loading Zones": v.get("School Loading Zones", ""),
+                "Layby Parking": v.get("Layby Parking", ""),
+                "Equipment Method": v.get("Equipment Method", ""),
+                "# of Equipment (Dump Trucks)": v.get("# of Equipment (Dump Trucks)", ""),
+                "Dump Truck Source (In-House/Contractor)": v.get("Dump Truck Source (In-House/Contractor)", ""),
+                "Snow Dump Site": v.get("Snow Dump Site", ""),
+                "# of Loads": v.get("# of Loads", ""),
                 "Tonnes": v.get("Tonnes", ""),
-                "SideBoth": v.get("One Side / Both Sides Cleared?", ""),
-                "RoadSide": v.get("Side of Road Cleared", ""),
-                "SnowSite": v.get("Snow Dump Site", ""),
-                "Comments": v.get("NOTES", ""),
+                "Shift Start Date": v.get("Shift Start Date", ""),
+                "Shift Start Time": v.get("Shift Start Time", ""),
+                "Shift End Date": v.get("Shift End Date", ""),
+                "Shift End Time": v.get("Shift End Time", ""),
+                "Supervisor 1": v.get("Supervisor 1", ""),
+                "Supervisor 2 (if relevant)": v.get("Supervisor 2 (if relevant)", ""),
+                "Supervisor 3 (if relevant)": v.get("Supervisor 3 (if relevant)", ""),
+                "Snow Removal by Contracted Crew or In-House?": v.get("Snow Removal by Contracted Crew or In-House?", ""),
+                "Contractor: # of Crews": v.get("Contractor: # of Crews", ""),
+                "Contractor: Crew TOA Area Responsibility": v.get("Contractor: Crew TOA Area Responsibility", ""),
+                "Contractor: Crew Number": v.get("Contractor: Crew Number", ""),
+                "In-House: Staff Responsibility (Base Yard)": v.get("In-House: Staff Responsibility (Base Yard)", ""),
+                "In-House: # of Staff": v.get("In-House: # of Staff", ""),
+                "NOTES": v.get("NOTES", ""),
             })
 
         street_endpoints = get_street_endpoints_index()
@@ -6491,6 +6743,7 @@ def edit_form(sid):
         districts_json=json.dumps(DISTRICTS),
         wards=wards,
         supervisors=latest_allowed_sets.get("Supervisor 1", []),
+        supervisors_json=json.dumps(latest_allowed_sets.get("Supervisor 1", [])),
         streets=(sorted(street_endpoints.keys(), key=lambda x: x.casefold()) if street_endpoints else latest_centre_streets),
         district_to_wards_json=json.dumps(DISTRICT_TO_WARDS),
         street_endpoints_json=json.dumps(street_endpoints, ensure_ascii=False),
@@ -6523,10 +6776,10 @@ def edit_submit(sid):
         if k in form:
             values[k] = form.get(k, "")
 
-    # Normalize date format (picker gives YYYY-MM-DD) and fill end-date safely
+    # Keep dates in YYYY-MM-DD format for HTML date inputs
     try:
         _date_picker = values.get("Shift Start Date", "")
-        values["Shift Start Date"] = format_date_from_picker(_date_picker) if _date_picker else values.get("Shift Start Date", "")
+        values["Shift Start Date"] = _date_picker if _date_picker else values.get("Shift Start Date", "")
         if not values.get("Shift End Date"):
             values["Shift End Date"] = values.get("Shift Start Date", "")
     except Exception:
@@ -6647,18 +6900,31 @@ def recompute_allowed_sets_from_master():
     allowed["District (Where Snow Removed)"] = list(STRICT_DISTRICTS) if STRICT_DISTRICTS else list(DISTRICTS)
     allowed["Ward (Where Snow Removed)"] = sorted(list(STRICT_WARDS) if STRICT_WARDS else list({w for ws in DISTRICT_TO_WARDS.values() for w in ws}), key=lambda x: int(x))
 
-    # Supervisors: try to load from the workbook reference tab
-    supervisors = []
-    try:
-        sup_df = pd.read_excel(MASTER_TRACKER_PATH, sheet_name="List of Supervisors - Reference", header=None)
-        if not sup_df.empty:
-            col0 = sup_df.iloc[:, 0].fillna("").astype(str).map(lambda x: x.strip()).tolist()
-            supervisors = [x for x in col0 if x and x.lower() != "nan"]
-    except Exception:
-        supervisors = []
-
-    if STRICT_SUPERVISORS:
-        supervisors = list(STRICT_SUPERVISORS)
+    # Supervisors: Start with STRICT_SUPERVISORS, then add any from data
+    supervisors = list(STRICT_SUPERVISORS) if STRICT_SUPERVISORS else []
+    
+    if MASTER_TRACKER_PATH.endswith('.csv'):
+        # CSV mode: extract unique supervisors from the actual data and ADD to the list
+        try:
+            df = read_master_csv()
+            if not df.empty:
+                sup_cols = ["Supervisor 1", "Supervisor 2 (if relevant)", "Supervisor 3 (if relevant)"]
+                for col in sup_cols:
+                    if col in df.columns:
+                        vals = df[col].fillna("").astype(str).map(lambda x: x.strip()).tolist()
+                        supervisors.extend([v for v in vals if v and v.lower() != "nan"])
+        except Exception:
+            pass  # Keep STRICT_SUPERVISORS
+    else:
+        # XLSX mode: try to load from reference sheet
+        try:
+            sup_df = pd.read_excel(MASTER_TRACKER_PATH, sheet_name="List of Supervisors - Reference", header=None)
+            if not sup_df.empty:
+                col0 = sup_df.iloc[:, 0].fillna("").astype(str).map(lambda x: x.strip()).tolist()
+                xlsx_sups = [x for x in col0 if x and x.lower() != "nan"]
+                supervisors.extend(xlsx_sups)
+        except Exception:
+            pass  # Keep STRICT_SUPERVISORS
 
     # de-dupe + sort
     seen = set()
