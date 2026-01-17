@@ -532,31 +532,19 @@ MASTER_COLUMNS = [
     "TOA Area (Where Snow Removed)",
     "Street",
     "From Intersection",
-    "To Intersection",
     "From Intersection ID",
+    "To Intersection",
     "To Intersection ID",
     "One Side / Both Sides Cleared?",
     "Side of Road Cleared",
-    "Infrastructure Type: Roadway",
-    "Infrastructure Type: Sidewalk",
-    "Infrastructure Type: Separated Cycling Infrastructure",
-    "Infrastructure Type: Bridge",
-    "Infrastructure Type: School Loading Zones",
-    "Clearing Activity: Plow",
-    "Clearing Activity: Plow Only",
-    "Clearing Activity: Windrow",
-    "Clearing Activity: Sidewalk Plow",
-    "Clearing Activity: Sidewalk Windrow",
-    "Clearing Activity: Salting",
-    "Clearing Activity: Anti-Icing",
-    "Clearing Activity: Snow Removal",
-    "Clearing Activity: Hauling",
-    "Clearing Activity: Blowing",
-    "Clearing Activity: Other",
-    "Clearing Activity: Other Notes",
+    "Roadway",
+    "Sidewalk",
+    "Separated Cycling Infrastructure",
+    "Bridge",
+    "School Loading Zones",
     "Equipment Method",
-    "Dump Truck Source (In-House/Contractor)",
     "# of Equipment (Dump Trucks)",
+    "Dump Truck Source (In-House/Contractor)",
     "Snow Dump Site",
     "# of Loads",
     "Tonnes",
@@ -564,17 +552,18 @@ MASTER_COLUMNS = [
     "Shift Start Time",
     "Shift End Date",
     "Shift End Time",
+    "Hours Worked",
+    "Time and Date of Data Entry Input",
     "Supervisor 1",
     "Supervisor 2 (if relevant)",
     "Supervisor 3 (if relevant)",
-    "Contracted Crew?",
-    "# of Crews (if relevant)",
-    "TOA Area (if relevant)",
-    "Crew Number (if relevant)",
-    "In-House: Responsibility",
+    "Snow Removal by Contracted Crew or In-House?",
+    "Contractor: # of Crews",
+    "Contractor: Crew TOA Area Responsibility",
+    "Contractor: Crew Number",
+    "In-House: Staff Responsibility (Base Yard)",
     "In-House: # of Staff",
     "NOTES",
-    "Time and Date of Data Entry Input",
 ]
 
 FORM_TO_MASTER = {
@@ -619,7 +608,10 @@ DISPLAY_FIELDS_FORM = [
     "Ward (Where Snow Removed)",
     "TOA Area (Where Snow Removed)",
     "Supervisor 1",
+    "Supervisor 2 (if relevant)",
+    "Supervisor 3 (if relevant)",
     "Shift Start Time",
+    "Shift End Date",
     "Shift End Time",
     "Equipment Method",
     "# of Equipment (Dump Trucks)",
@@ -630,6 +622,11 @@ DISPLAY_FIELDS_FORM = [
     "Tonnes",
     "One Side / Both Sides Cleared?",
     "Side of Road Cleared",
+    "Snow Removal by Contracted Crew or In-House?",
+    "Contractor: # of Crews",
+    "Contractor: Crew Number",
+    "In-House: Staff Responsibility (Base Yard)",
+    "In-House: # of Staff",
     "Street",
     "From Intersection",
     "To Intersection",
@@ -1561,43 +1558,36 @@ def apply_intake_to_master():
 
 def build_workorder_popup(props: dict) -> str:
     wo = props.get("WO", "")
+    date = props.get("ShiftStartDate", "")
+    district = props.get("District", "")
+    ward = props.get("Ward", "")
+    toa = props.get("TOA", "")
+    supervisor = props.get("Supervisor", "")
+    shift = props.get("Shift", "")
     street = props.get("Street", "")
     frm = props.get("From", "")
     to_ = props.get("To", "")
-
-    route_mode = props.get("route_mode", "")
-    supervisor = props.get("Supervisor", "")
-    district = props.get("District", "")
-    ward = props.get("Ward", "")
-    date = props.get("ShiftStartDate", "")
-    shift = props.get("Shift", "")
-
-    # All operational fields
-    toa = props.get("TOA", "")
     side = props.get("Side", "")
     road_side = props.get("RoadSide", "")
-    
-    roadway = props.get("Roadway", "")
+    roadway = props.get("Roadway", "")    
     sidewalk = props.get("Sidewalk", "")
     cycling = props.get("SeparatedCycling", "")
     bridge = props.get("Bridge", "")
     school = props.get("SchoolZones", "")
-    
     equipment = props.get("EquipmentMethod", "")
     dump_trucks = props.get("DumpTrucks", "")
     dump_source = props.get("DumpTruckSource", "")
     contractor_toa = props.get("ContractorTOA", "")
+    snow_site = props.get("SnowDumpSite", "")
     loads = props.get("Loads", "")
     tonnes = props.get("Tonnes", "")
-    snow_site = props.get("SnowDumpSite", "")
-    
     crew_type = props.get("CrewType", "")
     num_crews = props.get("NumCrews", "")
     crew_num = props.get("CrewNumber", "")
     inhouse = props.get("InHouseBase", "")
     num_staff = props.get("NumStaff", "")
-    
     notes = props.get("Notes", "")
+    route_mode = props.get("route_mode", "")
 
     # Helper: only show rows with data
     def row(label, val):
@@ -2386,59 +2376,111 @@ def build_everything():
 
             return "<table>" + "".join(rows) + "</table>"
 
-        def build_intersection_popup(wo_id, loc_raw, from_raw, to_raw, intersection_id):
-            return f"""
-            <div style="font-family:Arial;font-size:13px;">
-              <b>Intersection Point</b><br>
-              <b>WO:</b> {html.escape(str(wo_id))}<br>
-              <b>Street:</b> {html.escape(str(loc_raw))}<br>
-              <b>From:</b> {html.escape(str(from_raw))}<br>
-              <b>To:</b> {html.escape(str(to_raw))}<br>
-              <b>Intersection ID:</b> {html.escape(str(intersection_id))}<br>
-            </div>
-            """
-
         def build_segment_popup(props: dict) -> str:
+            """Build segment popup with ALL fields matching workorder popup structure."""
+            wo = props.get("WO_ID", "")
+            date = props.get("Date", "")
+            district = props.get("District", "")
+            ward = props.get("Ward", "")
+            toa = props.get("TOA", "")
+            supervisor = props.get("Supervisor", "")
+            shift = props.get("Shift", "")
+            street = props.get("Location", "")
+            frm = props.get("From", "")
+            to_ = props.get("To", "")
+            side = props.get("Side", "")
+            road_side = props.get("RoadSide", "")
+            roadway = props.get("Roadway", "")    
+            sidewalk = props.get("Sidewalk", "")
+            cycling = props.get("SeparatedCycling", "")
+            bridge = props.get("Bridge", "")
+            school = props.get("SchoolZones", "")
+            equipment = props.get("EquipmentMethod", "")
+            dump_trucks = props.get("DumpTrucks", "")
+            dump_source = props.get("DumpTruckSource", "")
+            contractor_toa = props.get("ContractorTOA", "")
+            snow_site = props.get("SnowDumpSite", "")
+            loads = props.get("Loads", "")
+            tonnes = props.get("Tonnes", "")
+            crew_type = props.get("CrewType", "")
+            num_crews = props.get("NumCrews", "")
+            crew_num = props.get("CrewNumber", "")
+            inhouse = props.get("InHouseBase", "")
+            num_staff = props.get("NumStaff", "")
+            notes = props.get("Comments", "") or props.get("Notes", "")
+            route_mode = props.get("route_mode", "")
+            
+            # Segment-specific fields
             wo_m_str = props.get("WO_m_display", "")
             wo_km_str = props.get("WO_km_display", "")
-            sup_html = props.get("Supervisor_link_html", html.escape(str(props.get("Supervisor", ""))))
-            shift_html = props.get("Shift_html", html.escape(str(props.get("Shift", ""))))
-
+            segment_count = props.get("Segment_count", "")
+            
+            # Helper: only show rows with data
+            def row(label, val):
+                v = str(val or "").strip()
+                if not v or v.lower() in ("nan", "none", ""):
+                    return ""
+                return f"<b>{html.escape(label)}:</b> {html.escape(v)}<br>"
+            
             extra = ""
-            if props.get("route_mode"):
+            if route_mode:
                 extra = (
                     "<div style='margin-top:6px;padding:6px;border-radius:6px;background:#fff3cd;border:1px solid #ffeeba;'>"
-                    f"<b>Routing:</b> {html.escape(str(props.get('route_mode')))}"
+                    f"<b>Routing:</b> {html.escape(str(route_mode))}"
                     "</div>"
                 )
-    
-            return f"""
             
-            <div style="font-family:Arial;font-size:13px;line-height:1.25;">
-              <b>WO:</b> {html.escape(str(props.get("WO_ID","")))}<br>
-              <b>Total Segments:</b> {html.escape(str(props.get("Segment_count","")))}<br>
-              <b>Street:</b> {html.escape(str(props.get("Location","")))}<br>
-              <b>To:</b> {html.escape(str(props.get("To","")))}<br>
-              <b>From:</b> {html.escape(str(props.get("From","")))}<br>
+            return f"""
+            <div style='font-family:Arial;font-size:13px;line-height:1.25;max-width:420px;'>
+              <div style='font-size:15px;font-weight:800;margin-bottom:8px;'>Work Order {html.escape(str(wo))}</div>
+              
+              <b>Street:</b> {html.escape(str(street))}<br>
+              <b>From:</b> {html.escape(str(frm))}<br>
+              <b>To:</b> {html.escape(str(to_))}<br>
+              {extra}
+              
+              <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+              
+              <b>Supervisor:</b> {html.escape(str(supervisor))}<br>
+              <b>District:</b> {html.escape(str(district))}<br>
+              <b>Ward:</b> {html.escape(str(ward))}<br>
+              {row('TOA Area', toa)}
+              <b>Date:</b> {html.escape(str(date))}<br>
+              <b>Shift:</b> {html.escape(str(shift))}<br>
+              
+              <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+              
+              {row('Side Cleared', side)}
+              {row('Road Side', road_side)}
+              {row('Roadway', roadway)}
+              {row('Sidewalk', sidewalk)}
+              {row('Cycling Infra', cycling)}
+              {row('Bridge', bridge)}
+              {row('School Zones', school)}
+              
+              <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+              
+              {row('Equipment', equipment)}
+              {row('Dump Trucks', dump_trucks)}
+              {row('Source', dump_source)}
+              {row('Contractor TOA', contractor_toa)}
+              {row('Loads', loads)}
+              {row('Tonnes', tonnes)}
+              {row('Snow Site', snow_site)}
+              
+              {row('Crew Type', crew_type)}
+              {row('# Crews', num_crews)}
+              {row('Crew #', crew_num)}
+              {row('In-House Base', inhouse)}
+              {row('# Staff', num_staff)}
+              
+              <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+              {row('Notes', notes)}
+              
+              <hr style='margin:8px 0;border:none;border-top:1px solid #ddd;'>
+              <b>Total Segments:</b> {html.escape(str(segment_count))}<br>
               <b>Distance (m):</b> {html.escape(str(wo_m_str))}<br>
               <b>Distance (km):</b> {html.escape(str(wo_km_str))}<br>
-              {extra}
-              <hr style="margin:6px 0;">
-              <b>Supervisor:</b> {sup_html}<br>
-              <b>District:</b> {html.escape(str(props.get("District","")))}<br>
-              <b>Ward:</b> {html.escape(str(props.get("Ward","")))}<br>
-              <b>Date:</b> {html.escape(str(props.get("Date","")))}<br>
-              <b>Shift:</b> {shift_html}<br>
-              <b>Type:</b> {html.escape(str(props.get("Type","")))}<br>
-              <hr style="margin:6px 0;">
-              <b>Dump Trucks:</b> {html.escape(str(props.get("DumpTrucks","")))}<br>
-              <b>Dump Truck Provider:</b> {html.escape(str(props.get("DumpTruckProvider","")))}<br>
-              <b>Loads:</b> {html.escape(str(props.get("Loads","")))}<br>
-              <b>Tonnes:</b> {html.escape(str(props.get("Tonnes","")))}<br>
-              <b>Side:</b> {html.escape(str(props.get("Side","")))}<br>
-              <b>Road Side:</b> {html.escape(str(props.get("RoadSide","")))}<br>
-              <b>Snow Dump Site:</b> {html.escape(str(props.get("SnowDumpSite","")))}<br>
-              <b>Comments:</b> {html.escape(str(props.get("Comments","")))}<br>
             </div>
             """
 
@@ -3279,11 +3321,11 @@ def build_everything():
                 "Side": clean_text(row.get("One Side / Both Sides Cleared?", "")),
                 "RoadSide": clean_text(row.get("Side of Road Cleared", "")),
                 
-                "Roadway": clean_text(row.get("Infrastructure Type: Roadway", "")),
-                "Sidewalk": clean_text(row.get("Infrastructure Type: Sidewalk", "")),
-                "SeparatedCycling": clean_text(row.get("Infrastructure Type: Separated Cycling Infrastructure", "")),
-                "Bridge": clean_text(row.get("Infrastructure Type: Bridge", "")),
-                "SchoolZones": clean_text(row.get("Infrastructure Type: School Loading Zones", "")),
+                "Roadway": clean_text(row.get("Roadway", "")),
+                "Sidewalk": clean_text(row.get("Sidewalk", "")),
+                "SeparatedCycling": clean_text(row.get("Separated Cycling Infrastructure", "")),
+                "Bridge": clean_text(row.get("Bridge", "")),
+                "SchoolZones": clean_text(row.get("School Loading Zones", "")),
                 
                 "EquipmentMethod": clean_text(row.get("Equipment Method", "")),
                 "DumpTrucks": clean_text(row.get("# of Equipment (Dump Trucks)", "")),
@@ -4608,11 +4650,11 @@ NEW_FORM_HTML = """
         <td>{{ r.get('To Intersection','') }}</td>
         <td>{{ r.get('One Side / Both Sides Cleared?','') }}</td>
         <td>{{ r.get('Side of Road Cleared','') }}</td>
-        <td>{{ r.get('Infrastructure Type: Roadway','') }}</td>
-        <td>{{ r.get('Infrastructure Type: Sidewalk','') }}</td>
-        <td>{{ r.get('Infrastructure Type: Separated Cycling Infrastructure','') }}</td>
-        <td>{{ r.get('Infrastructure Type: Bridge','') }}</td>
-        <td>{{ r.get('Infrastructure Type: School Loading Zones','') }}</td>
+        <td>{{ r.get('Roadway','') }}</td>
+        <td>{{ r.get('Sidewalk','') }}</td>
+        <td>{{ r.get('Separated Cycling Infrastructure','') }}</td>
+        <td>{{ r.get('Bridge','') }}</td>
+        <td>{{ r.get('School Loading Zones','') }}</td>
         <td>{{ r.get('Equipment Method','') }}</td>
         <td>{{ r.get('# of Equipment (Dump Trucks)','') }}</td>
         <td>{{ r.get('Dump Truck Source (In-House/Contractor)','') }}</td>
@@ -5591,11 +5633,11 @@ EDIT_FORM_HTML = """
     + '<td><input class="toIn" id="toIn" name="To Intersection" value="' + escapeHtml(row["To Intersection"]||"") + '"></td>'
     + '<td>' + simpleSelect('One Side / Both Sides Cleared?', ['Both Sides','One Side'], row["One Side / Both Sides Cleared?"]||"") + '</td>'
     + '<td>' + simpleSelect('Side of Road Cleared', ['North','South','East','West','East/West','North/South'], row["Side of Road Cleared"]||"") + '</td>'
-    + '<td>' + yesNoSelect('Infrastructure Type: Roadway', row["Infrastructure Type: Roadway"]||"") + '</td>'
-    + '<td>' + yesNoSelect('Infrastructure Type: Sidewalk', row["Infrastructure Type: Sidewalk"]||"") + '</td>'
-    + '<td>' + yesNoSelect('Infrastructure Type: Separated Cycling Infrastructure', row["Infrastructure Type: Separated Cycling Infrastructure"]||"") + '</td>'
-    + '<td>' + yesNoSelect('Infrastructure Type: Bridge', row["Infrastructure Type: Bridge"]||"") + '</td>'
-    + '<td>' + yesNoSelect('Infrastructure Type: School Loading Zones', row["Infrastructure Type: School Loading Zones"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Roadway', row["Roadway"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Sidewalk', row["Sidewalk"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Separated Cycling Infrastructure', row["Separated Cycling Infrastructure"]||"") + '</td>'
+    + '<td>' + yesNoSelect('Bridge', row["Bridge"]||"") + '</td>'
+    + '<td>' + yesNoSelect('School Loading Zones', row["School Loading Zones"]||"") + '</td>'
     + '<td><select name="Equipment Method" required><option value="">--</option>' + optList(types) + '</select></td>'
     + '<td><input name="# of Equipment (Dump Trucks)" type="number" min="0" value="' + escapeHtml(row["# of Equipment (Dump Trucks)"]||"") + '"></td>'
     + '<td>' + simpleSelect('Dump Truck Source (In-House/Contractor)', ['In-House','Contractor'], row["Dump Truck Source (In-House/Contractor)"]||"") + '</td>'
@@ -5978,12 +6020,12 @@ def new_submit():
         values["One Side / Both Sides Cleared?"] = g("One Side / Both Sides Cleared?")
         values["Side of Road Cleared"] = g("Side of Road Cleared")
 
-        # 10-14 Yes/No fields - FIX: Form sends "Roadway", but master expects "Infrastructure Type: Roadway"
-        values["Infrastructure Type: Roadway"] = g("Roadway")
-        values["Infrastructure Type: Sidewalk"] = g("Sidewalk")
-        values["Infrastructure Type: Separated Cycling Infrastructure"] = g("Separated Cycling Infrastructure")
-        values["Infrastructure Type: Bridge"] = g("Bridge")
-        values["Infrastructure Type: School Loading Zones"] = g("School Loading Zones")
+        # 10-14 Yes/No fields
+        values["Roadway"] = g("Roadway")
+        values["Sidewalk"] = g("Sidewalk")
+        values["Separated Cycling Infrastructure"] = g("Separated Cycling Infrastructure")
+        values["Bridge"] = g("Bridge")
+        values["School Loading Zones"] = g("School Loading Zones")
 
         # 15-20
         values["Equipment Method"] = g("Equipment Method")
